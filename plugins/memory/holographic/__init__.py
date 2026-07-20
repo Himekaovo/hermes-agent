@@ -71,6 +71,7 @@ FACT_STORE_SCHEMA = {
             "stale_days": {"type": "integer", "description": "Age window for 'diagnose' stale facts (default: 30)."},
             "low_trust_threshold": {"type": "number", "description": "Trust threshold for 'diagnose' low-trust facts (default: 0.3)."},
             "duplicate_threshold": {"type": "number", "description": "Token-overlap threshold for 'diagnose' duplicates (default: 0.72)."},
+            "scan_limit": {"type": "integer", "description": "Facts scanned for 'diagnose' duplicate detection (default: limit * 10)."},
             "limit": {"type": "integer", "description": "Max results (default: 10)."},
         },
         "required": ["action"],
@@ -337,6 +338,7 @@ class HolographicMemoryProvider(MemoryProvider):
                     stale_days=int(args.get("stale_days", 30)),
                     low_trust_threshold=float(args.get("low_trust_threshold", self._min_trust)),
                     duplicate_threshold=float(args.get("duplicate_threshold", 0.72)),
+                    scan_limit=int(args["scan_limit"]) if "scan_limit" in args else None,
                     limit=int(args.get("limit", 20)),
                 )
                 return json.dumps(report)

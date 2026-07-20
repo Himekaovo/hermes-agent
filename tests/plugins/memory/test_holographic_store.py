@@ -245,6 +245,72 @@ class TestProviderShutdown:
 
 
 class TestHealthDiagnostics:
+    def test_diagnose_health_uses_last_retrieved_at_for_stale_facts(self, db_path):
+        store = MemoryStore(db_path)
+        try:
+            fact_id = store.add_fact(
+                "The old deploy checklist was used once but has not been needed recently.",
+                category="project",
+            )
+            store.mark_retrieved([fact_id])
+            store._conn.execute(
+                """
+                UPDATE facts
+                SET updated_at = datetime('now', '-90 days'),
+                    last_retrieved_at = datetime('now', '-45 days')
+                WHERE fact_id = ?
+                """,
+                (fact_id,),
+            )
+            store._conn.commit()
+
+            report = store.diagnose_health(stale_days=30)
+        finally:
+            store.close()
+
+        assert any(f["fact_id"] == fact_id for f in report["stale"])
+        stale_fact = next(f for f in report["stale"] if f["fact_id"] == fact_id)
+        assert stale_fact["retrieval_count"] == 1
+        assert stale_fact["last_retrieved_at"] is not None
+
+    def test_diagnose_health_reports_duplicate_scan_scope(self, db_path):
+        store = MemoryStore(db_path)
+        try:
+            for idx in range(25):
+                store.add_fact(f"Diagnostic scan scope sample fact {idx}", category="project")
+
+            report = store.diagnose_health(limit=2)
+        finally:
+            store.close()
+
+        assert report["scan"] == {
+            "total_facts": 25,
+            "scanned_facts": 20,
+            "scan_limit": 20,
+            "result_limit": 2,
+            "truncated": True,
+        }
+
+    def test_diagnose_health_reports_clean_and_orphaned_consistency(self, db_path):
+        store = MemoryStore(db_path)
+        try:
+            store.add_fact("Healthy diagnostic consistency baseline.", category="project")
+            clean_report = store.diagnose_health()
+
+            store._conn.execute(
+                "INSERT OR IGNORE INTO fact_entities (fact_id, entity_id) VALUES (?, ?)",
+                (9999, 9999),
+            )
+            orphan_report = store.diagnose_health()
+        finally:
+            store.close()
+
+        assert clean_report["inconsistencies"] == []
+        assert {
+            "type": "orphaned_fact_entities",
+            "count": 1,
+        } in orphan_report["inconsistencies"]
+
     def test_diagnose_health_reports_stale_low_trust_and_duplicates(self, db_path):
         store = MemoryStore(db_path)
         try:
@@ -308,11 +374,13 @@ class TestHealthDiagnostics:
                     "stale_days": 30,
                     "low_trust_threshold": 0.3,
                     "duplicate_threshold": 0.4,
+                    "scan_limit": 50,
                 },
             ))
         finally:
             provider.shutdown()
 
+        assert result["scan"]["scan_limit"] == 50
         assert "duplicates" in result
         assert "stale" in result
         assert "low_trust" in result

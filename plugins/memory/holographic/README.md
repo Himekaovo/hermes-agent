@@ -41,4 +41,14 @@ context includes the same summary inline so recalled context is reviewable.
 
 `fact_store` with `action="diagnose"` returns a local memory health report:
 near duplicates, stale facts, low-trust facts, simple consistency checks, and
-cleanup recommendations.
+cleanup recommendations. It is read-only: it reports findings and suggestions
+but never removes, merges, or rewrites memory automatically.
+
+Duplicate detection scans the most recently updated facts. By default it scans
+`limit * 10` facts and returns up to `limit` findings; pass `scan_limit` to
+increase or reduce the scan window. The report includes a `scan` object with
+`total_facts`, `scanned_facts`, and `truncated` so partial scans are visible.
+
+Stale facts are based on last use, not just total retrieval count:
+`last_retrieved_at` is updated when a fact is recalled, and stale detection uses
+`COALESCE(last_retrieved_at, updated_at, created_at)` against `stale_days`.

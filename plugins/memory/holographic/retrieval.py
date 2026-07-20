@@ -120,6 +120,7 @@ class FactRetriever:
         # Strip raw HRR bytes — callers expect JSON-serializable dicts
         for fact in results:
             fact.pop("hrr_vector", None)
+        self._mark_retrieved(results)
         return results
 
     def probe(
@@ -172,7 +173,8 @@ class FactRetriever:
         rows = conn.execute(
             f"""
             SELECT fact_id, content, category, tags, trust_score,
-                   retrieval_count, helpful_count, created_at, updated_at,
+                   retrieval_count, helpful_count, last_retrieved_at,
+                   created_at, updated_at,
                    hrr_vector
             FROM facts
             {where}
@@ -198,7 +200,9 @@ class FactRetriever:
             scored.append(fact)
 
         scored.sort(key=lambda x: x["score"], reverse=True)
-        return scored[:limit]
+        results = scored[:limit]
+        self._mark_retrieved(results)
+        return results
 
     def related(
         self,
@@ -232,7 +236,8 @@ class FactRetriever:
         rows = conn.execute(
             f"""
             SELECT fact_id, content, category, tags, trust_score,
-                   retrieval_count, helpful_count, created_at, updated_at,
+                   retrieval_count, helpful_count, last_retrieved_at,
+                   created_at, updated_at,
                    hrr_vector
             FROM facts
             {where}
@@ -266,7 +271,9 @@ class FactRetriever:
             scored.append(fact)
 
         scored.sort(key=lambda x: x["score"], reverse=True)
-        return scored[:limit]
+        results = scored[:limit]
+        self._mark_retrieved(results)
+        return results
 
     def reason(
         self,
@@ -311,7 +318,8 @@ class FactRetriever:
         rows = conn.execute(
             f"""
             SELECT fact_id, content, category, tags, trust_score,
-                   retrieval_count, helpful_count, created_at, updated_at,
+                   retrieval_count, helpful_count, last_retrieved_at,
+                   created_at, updated_at,
                    hrr_vector
             FROM facts
             {where}
@@ -344,7 +352,9 @@ class FactRetriever:
             scored.append(fact)
 
         scored.sort(key=lambda x: x["score"], reverse=True)
-        return scored[:limit]
+        results = scored[:limit]
+        self._mark_retrieved(results)
+        return results
 
     def contradict(
         self,
@@ -470,7 +480,8 @@ class FactRetriever:
         rows = conn.execute(
             f"""
             SELECT fact_id, content, category, tags, trust_score,
-                   retrieval_count, helpful_count, created_at, updated_at,
+                   retrieval_count, helpful_count, last_retrieved_at,
+                   created_at, updated_at,
                    hrr_vector
             FROM facts
             {where}
@@ -487,7 +498,12 @@ class FactRetriever:
             scored.append(fact)
 
         scored.sort(key=lambda x: x["score"], reverse=True)
-        return scored[:limit]
+        results = scored[:limit]
+        self._mark_retrieved(results)
+        return results
+
+    def _mark_retrieved(self, results: list[dict]) -> None:
+        self.store.mark_retrieved([fact["fact_id"] for fact in results if "fact_id" in fact])
 
     @staticmethod
     def _build_recall_reason(
