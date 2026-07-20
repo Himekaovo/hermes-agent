@@ -6,6 +6,7 @@ Single-user Hermes memory store plugin.
 import re
 import sqlite3
 import threading
+from datetime import datetime, timezone
 from pathlib import Path
 
 try:
@@ -440,6 +441,90 @@ class MemoryStore:
                 "helpful_count": row["helpful_count"] + helpful_increment,
             }
 
+    def diagnose_health(
+        self,
+        *,
+        stale_days: int = 30,
+        low_trust_threshold: float = 0.3,
+        duplicate_threshold: float = 0.72,
+        limit: int = 20,
+    ) -> dict:
+        """Return a local health report for the memory store.
+
+        The report is deterministic and offline: no LLM calls, network calls,
+        or extra dependencies. It is meant to power a "dream mode" review loop
+        without making the provider autonomous by default.
+        """
+        stale_days = max(1, int(stale_days))
+        low_trust_threshold = _clamp_trust(float(low_trust_threshold))
+        duplicate_threshold = max(0.0, min(1.0, float(duplicate_threshold)))
+        limit = max(1, int(limit))
+
+        with self._lock:
+            facts = [
+                self._row_to_dict(row)
+                for row in self._conn.execute(
+                    """
+                    SELECT fact_id, content, category, tags, trust_score,
+                           retrieval_count, helpful_count, created_at, updated_at
+                    FROM facts
+                    ORDER BY updated_at DESC, fact_id DESC
+                    LIMIT ?
+                    """,
+                    (max(limit * 10, limit),),
+                ).fetchall()
+            ]
+
+            duplicates = self._find_near_duplicates(
+                facts,
+                threshold=duplicate_threshold,
+                limit=limit,
+            )
+
+            stale_rows = self._conn.execute(
+                """
+                SELECT fact_id, content, category, tags, trust_score,
+                       retrieval_count, helpful_count, created_at, updated_at
+                FROM facts
+                WHERE retrieval_count = 0
+                  AND datetime(COALESCE(updated_at, created_at)) <= datetime('now', ?)
+                ORDER BY updated_at ASC, fact_id ASC
+                LIMIT ?
+                """,
+                (f"-{stale_days} days", limit),
+            ).fetchall()
+            stale = [self._row_to_dict(row) for row in stale_rows]
+
+            low_trust_rows = self._conn.execute(
+                """
+                SELECT fact_id, content, category, tags, trust_score,
+                       retrieval_count, helpful_count, created_at, updated_at
+                FROM facts
+                WHERE trust_score < ?
+                ORDER BY trust_score ASC, updated_at ASC
+                LIMIT ?
+                """,
+                (low_trust_threshold, limit),
+            ).fetchall()
+            low_trust = [self._row_to_dict(row) for row in low_trust_rows]
+
+            inconsistencies = self._check_consistency()
+
+        recommendations = self._build_health_recommendations(
+            duplicates=duplicates,
+            stale=stale,
+            low_trust=low_trust,
+            inconsistencies=inconsistencies,
+        )
+        return {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "duplicates": duplicates,
+            "stale": stale,
+            "low_trust": low_trust,
+            "inconsistencies": inconsistencies,
+            "recommendations": recommendations,
+        }
+
     # ------------------------------------------------------------------
     # Entity helpers
     # ------------------------------------------------------------------
@@ -478,6 +563,107 @@ class MemoryStore:
             _add(m.group(2))
 
         return candidates
+
+    @staticmethod
+    def _diagnostic_tokens(text: str) -> set[str]:
+        tokens = set()
+        for word in (text or "").lower().split():
+            cleaned = word.strip(".,;:!?\"'()[]{}#@<>")
+            if len(cleaned) >= 3:
+                tokens.add(cleaned)
+        return tokens
+
+    @classmethod
+    def _diagnostic_overlap(cls, left: str, right: str) -> tuple[float, list[str]]:
+        left_tokens = cls._diagnostic_tokens(left)
+        right_tokens = cls._diagnostic_tokens(right)
+        if not left_tokens or not right_tokens:
+            return 0.0, []
+        shared = left_tokens & right_tokens
+        union = left_tokens | right_tokens
+        return len(shared) / len(union), sorted(shared)
+
+    def _find_near_duplicates(
+        self,
+        facts: list[dict],
+        *,
+        threshold: float,
+        limit: int,
+    ) -> list[dict]:
+        pairs = []
+        for idx, left in enumerate(facts):
+            for right in facts[idx + 1:]:
+                overlap, shared_terms = self._diagnostic_overlap(
+                    left.get("content", ""),
+                    right.get("content", ""),
+                )
+                if overlap >= threshold:
+                    pairs.append({
+                        "fact_a": left,
+                        "fact_b": right,
+                        "overlap_score": round(overlap, 3),
+                        "shared_terms": shared_terms,
+                    })
+        pairs.sort(key=lambda item: item["overlap_score"], reverse=True)
+        return pairs[:limit]
+
+    def _check_consistency(self) -> list[dict]:
+        inconsistencies = []
+        fact_count = self._conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0]
+        try:
+            fts_count = self._conn.execute("SELECT COUNT(*) FROM facts_fts").fetchone()[0]
+        except sqlite3.Error as exc:
+            inconsistencies.append({"type": "fts_unavailable", "detail": str(exc)})
+            fts_count = fact_count
+        if fts_count != fact_count:
+            inconsistencies.append({
+                "type": "fts_count_mismatch",
+                "facts": fact_count,
+                "facts_fts": fts_count,
+            })
+
+        orphan_links = self._conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM fact_entities fe
+            LEFT JOIN facts f ON f.fact_id = fe.fact_id
+            LEFT JOIN entities e ON e.entity_id = fe.entity_id
+            WHERE f.fact_id IS NULL OR e.entity_id IS NULL
+            """
+        ).fetchone()[0]
+        if orphan_links:
+            inconsistencies.append({
+                "type": "orphaned_fact_entities",
+                "count": orphan_links,
+            })
+        return inconsistencies
+
+    @staticmethod
+    def _build_health_recommendations(
+        *,
+        duplicates: list[dict],
+        stale: list[dict],
+        low_trust: list[dict],
+        inconsistencies: list[dict],
+    ) -> list[str]:
+        recommendations = []
+        if duplicates:
+            recommendations.append(
+                f"Review {len(duplicates)} near-duplicate fact pair(s) and merge or remove redundant memories."
+            )
+        if stale:
+            recommendations.append(
+                f"Review {len(stale)} stale fact(s) that have not been retrieved recently."
+            )
+        if low_trust:
+            recommendations.append(
+                f"Review {len(low_trust)} low-trust fact(s) before using them as authoritative context."
+            )
+        if inconsistencies:
+            recommendations.append(
+                f"Repair {len(inconsistencies)} local index/link consistency issue(s)."
+            )
+        return recommendations
 
     def _resolve_entity(self, name: str) -> int:
         """Find an existing entity by name or alias (case-insensitive) or create one.

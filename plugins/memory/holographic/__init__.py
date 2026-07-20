@@ -48,6 +48,7 @@ FACT_STORE_SCHEMA = {
         "• related — What connects to an entity? Structural adjacency.\n"
         "• reason — Compositional: facts connected to MULTIPLE entities simultaneously.\n"
         "• contradict — Memory hygiene: find facts making conflicting claims.\n"
+        "• diagnose — Memory health report: duplicates, stale facts, low trust, index checks.\n"
         "• update/remove/list — CRUD operations.\n\n"
         "IMPORTANT: Before answering questions about the user, ALWAYS probe or reason first."
     ),
@@ -56,7 +57,7 @@ FACT_STORE_SCHEMA = {
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["add", "search", "probe", "related", "reason", "contradict", "update", "remove", "list"],
+                "enum": ["add", "search", "probe", "related", "reason", "contradict", "diagnose", "update", "remove", "list"],
             },
             "content": {"type": "string", "description": "Fact content (required for 'add')."},
             "query": {"type": "string", "description": "Search query (required for 'search')."},
@@ -67,6 +68,9 @@ FACT_STORE_SCHEMA = {
             "tags": {"type": "string", "description": "Comma-separated tags."},
             "trust_delta": {"type": "number", "description": "Trust adjustment for 'update'."},
             "min_trust": {"type": "number", "description": "Minimum trust filter (default: 0.3)."},
+            "stale_days": {"type": "integer", "description": "Age window for 'diagnose' stale facts (default: 30)."},
+            "low_trust_threshold": {"type": "number", "description": "Trust threshold for 'diagnose' low-trust facts (default: 0.3)."},
+            "duplicate_threshold": {"type": "number", "description": "Token-overlap threshold for 'diagnose' duplicates (default: 0.72)."},
             "limit": {"type": "integer", "description": "Max results (default: 10)."},
         },
         "required": ["action"],
@@ -213,7 +217,11 @@ class HolographicMemoryProvider(MemoryProvider):
             lines = []
             for r in results:
                 trust = r.get("trust_score", r.get("trust", 0))
-                lines.append(f"- [{trust:.1f}] {r.get('content', '')}")
+                line = f"- [{trust:.1f}] {r.get('content', '')}"
+                reason = r.get("reason")
+                if isinstance(reason, dict) and reason.get("summary"):
+                    line += f" (reason: {reason['summary']})"
+                lines.append(line)
             return "## Holographic Memory\n" + "\n".join(lines)
         except Exception as e:
             logger.debug("Holographic prefetch failed: %s", e)
@@ -323,6 +331,15 @@ class HolographicMemoryProvider(MemoryProvider):
                     limit=int(args.get("limit", 10)),
                 )
                 return json.dumps({"results": results, "count": len(results)})
+
+            elif action == "diagnose":
+                report = store.diagnose_health(
+                    stale_days=int(args.get("stale_days", 30)),
+                    low_trust_threshold=float(args.get("low_trust_threshold", self._min_trust)),
+                    duplicate_threshold=float(args.get("duplicate_threshold", 0.72)),
+                    limit=int(args.get("limit", 20)),
+                )
+                return json.dumps(report)
 
             elif action == "update":
                 updated = store.update_fact(

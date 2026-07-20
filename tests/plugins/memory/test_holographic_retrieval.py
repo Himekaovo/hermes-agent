@@ -11,6 +11,7 @@ import pytest
 
 pytest.importorskip("numpy")  # retrieval module imports numpy indirectly
 
+from plugins.memory.holographic import HolographicMemoryProvider
 from plugins.memory.holographic.retrieval import FactRetriever
 from plugins.memory.holographic.store import MemoryStore
 
@@ -127,3 +128,39 @@ def test_prefetch_stopword_only_query_empty(retriever_with_facts):
     results = retriever_with_facts.search("the and of")
     # Either zero results or it errored-gracefully to [] — both are fine
     assert isinstance(results, list)
+
+
+def test_search_result_explains_why_fact_was_recalled(retriever_with_facts):
+    """Search results should carry a deterministic recall reason."""
+    results = retriever_with_facts.search(
+        "what happened with the deployment rollback"
+    )
+
+    assert results
+    reason = results[0]["reason"]
+    assert reason["strategy"] == "fts+jaccard+hrr+trust"
+    assert {"deployment", "rollback"} <= set(reason["matched_terms"])
+    assert "signals" in reason
+    assert "trust" in reason["signals"]
+    assert "deployment" in reason["summary"].lower()
+
+
+def test_prefetch_includes_recall_reason(tmp_path):
+    """Injected memory context should make recall decisions reviewable."""
+    provider = HolographicMemoryProvider(
+        config={"db_path": str(tmp_path / "memory_store.db")}
+    )
+    provider.initialize("prefetch-session")
+    try:
+        provider._store.add_fact(
+            "The Thursday deployment rollback failed because of stale migration state.",
+            category="project",
+        )
+
+        context = provider.prefetch("why did deployment rollback fail")
+    finally:
+        provider.shutdown()
+
+    assert "## Holographic Memory" in context
+    assert "reason:" in context.lower()
+    assert "deployment" in context.lower()

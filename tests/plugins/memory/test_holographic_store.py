@@ -11,6 +11,7 @@ visibility, concurrent multi-instance writers, and write-lock release after
 a failed write.
 """
 
+import json
 import sqlite3
 import threading
 
@@ -241,3 +242,79 @@ class TestProviderShutdown:
         b._store.add_fact("write after sibling shutdown")
         b.shutdown()
         assert MemoryStore._shared == {}
+
+
+class TestHealthDiagnostics:
+    def test_diagnose_health_reports_stale_low_trust_and_duplicates(self, db_path):
+        store = MemoryStore(db_path)
+        try:
+            stale_id = store.add_fact(
+                "The legacy scheduler has not been used since the migration.",
+                category="project",
+            )
+            low_trust_id = store.add_fact(
+                "The deployment rollback always succeeds.",
+                category="project",
+            )
+            duplicate_a_id = store.add_fact(
+                "The deployment rollback failed because of stale migration state.",
+                category="project",
+            )
+            duplicate_b_id = store.add_fact(
+                "Deployment rollback failed due to stale migration state.",
+                category="project",
+            )
+
+            store.update_fact(low_trust_id, trust_delta=-0.4)
+            store._conn.execute(
+                "UPDATE facts SET updated_at = datetime('now', '-45 days') WHERE fact_id = ?",
+                (stale_id,),
+            )
+            store._conn.commit()
+
+            report = store.diagnose_health(
+                stale_days=30,
+                low_trust_threshold=0.3,
+                duplicate_threshold=0.4,
+                limit=20,
+            )
+        finally:
+            store.close()
+
+        assert any(f["fact_id"] == stale_id for f in report["stale"])
+        assert any(f["fact_id"] == low_trust_id for f in report["low_trust"])
+        duplicate_pairs = {
+            frozenset((pair["fact_a"]["fact_id"], pair["fact_b"]["fact_id"]))
+            for pair in report["duplicates"]
+        }
+        assert frozenset((duplicate_a_id, duplicate_b_id)) in duplicate_pairs
+        assert report["recommendations"]
+
+    def test_fact_store_diagnose_action_returns_report(self, db_path):
+        from plugins.memory.holographic import HolographicMemoryProvider
+
+        provider = HolographicMemoryProvider(config={"db_path": str(db_path)})
+        provider.initialize("diagnose-session")
+        try:
+            provider._store.add_fact(
+                "Deployment rollback failed because of stale migration state.",
+                category="project",
+            )
+
+            result = json.loads(provider.handle_tool_call(
+                "fact_store",
+                {
+                    "action": "diagnose",
+                    "stale_days": 30,
+                    "low_trust_threshold": 0.3,
+                    "duplicate_threshold": 0.4,
+                },
+            ))
+        finally:
+            provider.shutdown()
+
+        assert "duplicates" in result
+        assert "stale" in result
+        assert "low_trust" in result
+        assert "inconsistencies" in result
+        assert "recommendations" in result

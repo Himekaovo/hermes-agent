@@ -97,10 +97,21 @@ class FactRetriever:
             score = relevance * fact["trust_score"]
 
             # Optional temporal decay
+            decay = 1.0
             if self.half_life > 0:
-                score *= self._temporal_decay(fact.get("updated_at") or fact.get("created_at"))
+                decay = self._temporal_decay(fact.get("updated_at") or fact.get("created_at"))
+                score *= decay
 
             fact["score"] = score
+            fact["reason"] = self._build_recall_reason(
+                query_tokens=query_tokens,
+                fact_tokens=all_tokens,
+                fts_score=fts_score,
+                jaccard=jaccard,
+                hrr_sim=hrr_sim,
+                trust_score=fact["trust_score"],
+                temporal_decay=decay,
+            )
             scored.append(fact)
 
         # Sort by score descending, return top limit
@@ -477,6 +488,44 @@ class FactRetriever:
 
         scored.sort(key=lambda x: x["score"], reverse=True)
         return scored[:limit]
+
+    @staticmethod
+    def _build_recall_reason(
+        *,
+        query_tokens: set[str],
+        fact_tokens: set[str],
+        fts_score: float,
+        jaccard: float,
+        hrr_sim: float,
+        trust_score: float,
+        temporal_decay: float,
+    ) -> dict:
+        """Explain why a fact was recalled using deterministic ranking signals."""
+        matched_terms = sorted(query_tokens & fact_tokens)
+        signals = {
+            "fts": round(float(fts_score), 3),
+            "token_overlap": round(float(jaccard), 3),
+            "hrr": round(float(hrr_sim), 3),
+            "trust": round(float(trust_score), 3),
+            "temporal_decay": round(float(temporal_decay), 3),
+        }
+        if matched_terms:
+            term_text = ", ".join(matched_terms[:6])
+            summary = (
+                f"Matched terms: {term_text}; trust {signals['trust']:.2f}; "
+                f"ranked by FTS, token overlap, HRR, and trust."
+            )
+        else:
+            summary = (
+                f"No direct token overlap; trust {signals['trust']:.2f}; "
+                "ranked by FTS, HRR, and trust signals."
+            )
+        return {
+            "strategy": "fts+jaccard+hrr+trust",
+            "matched_terms": matched_terms,
+            "signals": signals,
+            "summary": summary,
+        }
 
     def _fts_candidates(
         self,

@@ -32,5 +32,13 @@ Config in `config.yaml` under `plugins.hermes-memory-store`:
 
 | Tool | Description |
 |------|-------------|
-| `fact_store` | 9 actions: add, search, probe, related, reason, contradict, update, remove, list |
+| `fact_store` | 10 actions: add, search, probe, related, reason, contradict, diagnose, update, remove, list |
 | `fact_feedback` | Rate facts as helpful/unhelpful (trains trust scores) |
+
+Search results include a `reason` object explaining why the fact was recalled:
+matched query terms, scoring signals, and a short summary. Prefetched memory
+context includes the same summary inline so recalled context is reviewable.
+
+`fact_store` with `action="diagnose"` returns a local memory health report:
+near duplicates, stale facts, low-trust facts, simple consistency checks, and
+cleanup recommendations.
