@@ -22,6 +22,7 @@ CREATE TABLE IF NOT EXISTS facts (
     tags            TEXT DEFAULT '',
     trust_score     REAL DEFAULT 0.5,
     retrieval_count INTEGER DEFAULT 0,
+    last_retrieved_at TIMESTAMP,
     helpful_count   INTEGER DEFAULT 0,
     created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -180,6 +181,8 @@ class MemoryStore:
         columns = {row[1] for row in self._conn.execute("PRAGMA table_info(facts)").fetchall()}
         if "hrr_vector" not in columns:
             self._conn.execute("ALTER TABLE facts ADD COLUMN hrr_vector BLOB")
+        if "last_retrieved_at" not in columns:
+            self._conn.execute("ALTER TABLE facts ADD COLUMN last_retrieved_at TIMESTAMP")
         self._conn.commit()
 
     # ------------------------------------------------------------------
@@ -241,7 +244,7 @@ class MemoryStore:
         """Full-text search over facts using FTS5.
 
         Returns a list of fact dicts ordered by FTS5 rank, then trust_score
-        descending. Also increments retrieval_count for matched facts.
+        descending. Also records when matched facts were retrieved.
         """
         with self._lock:
             query = query.strip()
@@ -265,7 +268,7 @@ class MemoryStore:
             sql = f"""
                 SELECT f.fact_id, f.content, f.category, f.tags,
                        f.trust_score, f.retrieval_count, f.helpful_count,
-                       f.created_at, f.updated_at
+                       f.last_retrieved_at, f.created_at, f.updated_at
                 FROM facts f
                 JOIN facts_fts fts ON fts.rowid = f.fact_id
                 WHERE facts_fts MATCH ?
@@ -279,13 +282,7 @@ class MemoryStore:
             results = [self._row_to_dict(r) for r in rows]
 
             if results:
-                ids = [r["fact_id"] for r in results]
-                placeholders = ",".join("?" * len(ids))
-                self._conn.execute(
-                    f"UPDATE facts SET retrieval_count = retrieval_count + 1 WHERE fact_id IN ({placeholders})",
-                    ids,
-                )
-                self._conn.commit()
+                self.mark_retrieved([r["fact_id"] for r in results])
 
             return results
 
@@ -390,7 +387,8 @@ class MemoryStore:
 
             sql = f"""
                 SELECT fact_id, content, category, tags, trust_score,
-                       retrieval_count, helpful_count, created_at, updated_at
+                       retrieval_count, helpful_count, last_retrieved_at,
+                       created_at, updated_at
                 FROM facts
                 WHERE trust_score >= ?
                   {category_clause}
@@ -399,6 +397,24 @@ class MemoryStore:
             """
             rows = self._conn.execute(sql, params).fetchall()
             return [self._row_to_dict(r) for r in rows]
+
+    def mark_retrieved(self, fact_ids: list[int]) -> None:
+        """Record successful retrieval for the given facts."""
+        ids = [int(fid) for fid in fact_ids if fid is not None]
+        if not ids:
+            return
+        with self._lock:
+            placeholders = ",".join("?" * len(ids))
+            self._conn.execute(
+                f"""
+                UPDATE facts
+                SET retrieval_count = retrieval_count + 1,
+                    last_retrieved_at = CURRENT_TIMESTAMP
+                WHERE fact_id IN ({placeholders})
+                """,
+                ids,
+            )
+            self._conn.commit()
 
     def record_feedback(self, fact_id: int, helpful: bool) -> dict:
         """Record user feedback and adjust trust asymmetrically.
@@ -447,6 +463,7 @@ class MemoryStore:
         stale_days: int = 30,
         low_trust_threshold: float = 0.3,
         duplicate_threshold: float = 0.72,
+        scan_limit: int | None = None,
         limit: int = 20,
     ) -> dict:
         """Return a local health report for the memory store.
@@ -459,21 +476,31 @@ class MemoryStore:
         low_trust_threshold = _clamp_trust(float(low_trust_threshold))
         duplicate_threshold = max(0.0, min(1.0, float(duplicate_threshold)))
         limit = max(1, int(limit))
+        scan_limit = max(1, int(scan_limit if scan_limit is not None else limit * 10))
 
         with self._lock:
+            total_facts = self._conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0]
             facts = [
                 self._row_to_dict(row)
                 for row in self._conn.execute(
                     """
                     SELECT fact_id, content, category, tags, trust_score,
-                           retrieval_count, helpful_count, created_at, updated_at
+                           retrieval_count, helpful_count, last_retrieved_at,
+                           created_at, updated_at
                     FROM facts
                     ORDER BY updated_at DESC, fact_id DESC
                     LIMIT ?
                     """,
-                    (max(limit * 10, limit),),
+                    (scan_limit,),
                 ).fetchall()
             ]
+            scan = {
+                "total_facts": total_facts,
+                "scanned_facts": len(facts),
+                "scan_limit": scan_limit,
+                "result_limit": limit,
+                "truncated": total_facts > len(facts),
+            }
 
             duplicates = self._find_near_duplicates(
                 facts,
@@ -484,10 +511,10 @@ class MemoryStore:
             stale_rows = self._conn.execute(
                 """
                 SELECT fact_id, content, category, tags, trust_score,
-                       retrieval_count, helpful_count, created_at, updated_at
+                       retrieval_count, helpful_count, last_retrieved_at,
+                       created_at, updated_at
                 FROM facts
-                WHERE retrieval_count = 0
-                  AND datetime(COALESCE(updated_at, created_at)) <= datetime('now', ?)
+                WHERE datetime(COALESCE(last_retrieved_at, updated_at, created_at)) <= datetime('now', ?)
                 ORDER BY updated_at ASC, fact_id ASC
                 LIMIT ?
                 """,
@@ -498,7 +525,8 @@ class MemoryStore:
             low_trust_rows = self._conn.execute(
                 """
                 SELECT fact_id, content, category, tags, trust_score,
-                       retrieval_count, helpful_count, created_at, updated_at
+                       retrieval_count, helpful_count, last_retrieved_at,
+                       created_at, updated_at
                 FROM facts
                 WHERE trust_score < ?
                 ORDER BY trust_score ASC, updated_at ASC
@@ -518,6 +546,7 @@ class MemoryStore:
         )
         return {
             "generated_at": datetime.now(timezone.utc).isoformat(),
+            "scan": scan,
             "duplicates": duplicates,
             "stale": stale,
             "low_trust": low_trust,

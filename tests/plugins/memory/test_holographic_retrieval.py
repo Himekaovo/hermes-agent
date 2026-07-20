@@ -145,6 +145,30 @@ def test_search_result_explains_why_fact_was_recalled(retriever_with_facts):
     assert "deployment" in reason["summary"].lower()
 
 
+def test_search_marks_recalled_facts_as_used(tmp_path):
+    """A recalled fact should record when it was last used."""
+    store = MemoryStore(str(tmp_path / "test_facts.db"))
+    try:
+        fact_id = store.add_fact(
+            "The Thursday deployment rollback failed because of stale migration state.",
+            category="project",
+        )
+        retriever = FactRetriever(store=store)
+
+        results = retriever.search("deployment rollback")
+
+        row = store._conn.execute(
+            "SELECT retrieval_count, last_retrieved_at FROM facts WHERE fact_id = ?",
+            (fact_id,),
+        ).fetchone()
+    finally:
+        store.close()
+
+    assert results
+    assert row["retrieval_count"] == 1
+    assert row["last_retrieved_at"] is not None
+
+
 def test_prefetch_includes_recall_reason(tmp_path):
     """Injected memory context should make recall decisions reviewable."""
     provider = HolographicMemoryProvider(
