@@ -286,3 +286,31 @@ def test_remove_relation_returns_value_record(tmp_path):
 
     assert result.available is True
     assert result.value["removed"] is True
+
+
+def test_list_relations_does_not_create_missing_database(tmp_path):
+    from tools.skillwiki import SkillWiki
+
+    db = tmp_path / "missing" / "provenance.db"
+    result = SkillWiki(db).list_relations()
+
+    assert result.available is False
+    assert not db.exists()
+
+
+def test_check_reports_malformed_local_path_without_raising(tmp_path, monkeypatch):
+    from tools import skillwiki
+
+    wiki = skillwiki.SkillWiki(tmp_path / "provenance.db")
+    result = wiki.record_import(
+        _bundle("demo", "acme/demo", {"SKILL.md": "# demo"}), tmp_path / "demo"
+    )
+    def broken_path(_value):
+        raise ValueError("malformed path")
+
+    monkeypatch.setattr(skillwiki, "Path", broken_path)
+
+    report = wiki.check(result.value["skill_id"])
+
+    assert report["available"] is True
+    assert report["skills"][0]["diagnostic"] == "local_path_unavailable"

@@ -243,7 +243,7 @@ class SkillWiki:
                     local_hash = _local_hash(Path(local_path))
                     prior_metadata = _row(existing)["metadata"]
                     prior_local_hash = prior_metadata.get("_last_local_hash")
-                    if local_hash is not None and local_hash != content_hash and local_hash != prior_local_hash:
+                    if local_hash is not None and local_hash != existing["content_hash"] and local_hash != prior_local_hash:
                         modified_count += 1
                     if local_hash is not None:
                         metadata["_last_local_hash"] = local_hash
@@ -335,8 +335,10 @@ class SkillWiki:
             return self._unavailable()
 
     def list_relations(self, skill_id: Optional[str] = None) -> SkillWikiResult:
+        if not self.db_path.exists():
+            return self._unavailable()
         try:
-            with self._connection() as db:
+            with self._connection(initialize=False) as db:
                 if skill_id is None:
                     rows = db.execute("SELECT * FROM relations ORDER BY from_skill_id, to_skill_id, relation").fetchall()
                 else:
@@ -388,24 +390,33 @@ class SkillWiki:
         skills = result.items
         checked = []
         for skill in skills:
-            local_path = Path(skill["local_path"])
-            exists = local_path.is_dir()
-            local_hash = None
-            hash_available = False
-            diagnostic = None
-            if exists:
-                try:
-                    local_hash = _local_hash(local_path)
-                    hash_available = True
-                except OSError:
-                    diagnostic = "local_hash_unavailable"
-            checked.append({
-                **skill,
-                "local_path_exists": exists,
-                "local_hash_available": hash_available,
-                "content_drift": bool(hash_available and exists and local_hash != skill["content_hash"]),
-                **({"diagnostic": diagnostic} if diagnostic else {}),
-            })
+            try:
+                local_path = Path(skill["local_path"])
+                exists = local_path.is_dir()
+                local_hash = None
+                hash_available = False
+                diagnostic = None
+                if exists:
+                    try:
+                        local_hash = _local_hash(local_path)
+                        hash_available = True
+                    except OSError:
+                        diagnostic = "local_hash_unavailable"
+                checked.append({
+                    **skill,
+                    "local_path_exists": exists,
+                    "local_hash_available": hash_available,
+                    "content_drift": bool(hash_available and exists and local_hash != skill["content_hash"]),
+                    **({"diagnostic": diagnostic} if diagnostic else {}),
+                })
+            except (OSError, TypeError, ValueError):
+                checked.append({
+                    **skill,
+                    "local_path_exists": False,
+                    "local_hash_available": False,
+                    "content_drift": False,
+                    "diagnostic": "local_path_unavailable",
+                })
         return {"available": True, "reason": None, "skills": checked}
 
     def advisory_evaluation(self, skill_id: Optional[str] = None) -> dict:
