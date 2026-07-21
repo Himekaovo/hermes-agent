@@ -386,6 +386,19 @@ def test_check_reports_unresolved_relation_targets(tmp_path):
     ]
 
 
+def test_scoped_check_does_not_mislabel_existing_relation_target(tmp_path):
+    from tools.skillwiki import SkillWiki
+
+    wiki = SkillWiki(tmp_path / "provenance.db")
+    wiki.record_import(_bundle("a", "acme/a", {"SKILL.md": "# a"}), tmp_path / "a")
+    wiki.record_import(_bundle("b", "acme/b", {"SKILL.md": "# b"}), tmp_path / "b")
+    wiki.add_relation("github:acme/a:", "github:acme/b:", "depends_on")
+
+    report = wiki.check("github:acme/a:")
+
+    assert report["unresolved_relations"] == []
+
+
 def test_advisory_evaluation_returns_observation_without_transition(tmp_path):
     from tools.skillwiki import SkillWiki
 

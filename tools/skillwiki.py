@@ -444,7 +444,12 @@ class SkillWiki:
         unresolved_relations = []
         relation_result = self.list_relations(skill_id)
         if relation_result.available:
-            skill_ids = {skill["skill_id"] for skill in skills}
+            all_skills_result = self.list_skills()
+            known_skill_ids = (
+                {skill["skill_id"] for skill in all_skills_result.items}
+                if all_skills_result.available
+                else set()
+            )
             unresolved_relations = [
                 {
                     "from_skill_id": relation["from_skill_id"],
@@ -452,8 +457,8 @@ class SkillWiki:
                     "relation": relation["relation"],
                 }
                 for relation in relation_result.items
-                if relation["from_skill_id"] not in skill_ids
-                or relation["to_skill_id"] not in skill_ids
+                if relation["from_skill_id"] not in known_skill_ids
+                or relation["to_skill_id"] not in known_skill_ids
             ]
         return {
             "available": True,
