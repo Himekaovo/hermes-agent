@@ -31,12 +31,13 @@ LIFECYCLE_STATUSES = (
     "archived",
 )
 RELATIONS = ("inspired_by", "depends_on", "references")
+RELATION_TYPES = frozenset(RELATIONS)
 _STATUS_CHECK_SQL = "status IN (" + ", ".join(repr(status) for status in LIFECYCLE_STATUSES) + ")"
 
 ALLOWED_TRANSITIONS = {
-    "raw": {"candidate", "archived"},
-    "candidate": {"draft", "deprecated", "archived"},
-    "draft": {"verified", "degraded", "deprecated", "archived"},
+    "raw": {"candidate", "degraded", "archived"},
+    "candidate": {"draft", "degraded", "archived"},
+    "draft": {"verified", "degraded", "archived"},
     "verified": {"release", "degraded", "deprecated", "archived"},
     "release": {"degraded", "deprecated", "archived"},
     "degraded": {"draft", "deprecated", "archived"},
@@ -325,20 +326,27 @@ class SkillWiki:
 
     def add_relation(self, from_skill_id: str, to_skill_id: str, relation: str) -> SkillWikiResult:
         try:
-            if relation not in RELATIONS:
+            if relation not in RELATION_TYPES:
                 return SkillWikiResult(False, "invalid_relation")
             with self._connection() as db:
-                db.execute(
+                cursor = db.execute(
                     "INSERT OR IGNORE INTO relations VALUES (?, ?, ?, ?)",
                     (from_skill_id, to_skill_id, relation, _now()),
                 )
-                item = {"from_skill_id": from_skill_id, "to_skill_id": to_skill_id, "relation": relation}
+                item = {
+                    "from_skill_id": from_skill_id,
+                    "to_skill_id": to_skill_id,
+                    "relation": relation,
+                    "inserted": cursor.rowcount == 1,
+                }
                 return SkillWikiResult(True, items=[item], value=item)
         except (sqlite3.Error, OSError, ValueError, TypeError, KeyError):
             return self._unavailable()
 
     def remove_relation(self, from_skill_id: str, to_skill_id: str, relation: str) -> SkillWikiResult:
         try:
+            if relation not in RELATION_TYPES:
+                return SkillWikiResult(False, "invalid_relation")
             with self._connection() as db:
                 cursor = db.execute(
                     "DELETE FROM relations WHERE from_skill_id=? AND to_skill_id=? AND relation=?",
@@ -371,13 +379,13 @@ class SkillWiki:
         skill_id: str,
         to_status: str,
         *,
-        actor: str = "system",
+        actor: str,
         reason: str = "",
     ) -> SkillWikiResult:
         try:
             if to_status not in LIFECYCLE_STATUSES:
                 return SkillWikiResult(False, "invalid_status")
-            if not actor.strip():
+            if not isinstance(actor, str) or not actor.strip():
                 return SkillWikiResult(False, "invalid_actor")
             with self._connection() as db:
                 current = db.execute("SELECT * FROM skills WHERE skill_id=?", (skill_id,)).fetchone()
@@ -433,15 +441,48 @@ class SkillWiki:
                     "content_drift": False,
                     "diagnostic": "local_path_unavailable",
                 })
-        return {"available": True, "reason": None, "skills": checked}
+        unresolved_relations = []
+        relation_result = self.list_relations(skill_id)
+        if relation_result.available:
+            skill_ids = {skill["skill_id"] for skill in skills}
+            unresolved_relations = [
+                {
+                    "from_skill_id": relation["from_skill_id"],
+                    "to_skill_id": relation["to_skill_id"],
+                    "relation": relation["relation"],
+                }
+                for relation in relation_result.items
+                if relation["from_skill_id"] not in skill_ids
+                or relation["to_skill_id"] not in skill_ids
+            ]
+        return {
+            "available": True,
+            "reason": None,
+            "skills": checked,
+            "unresolved_relations": unresolved_relations,
+        }
 
-    def advisory_evaluation(self, skill_id: Optional[str] = None) -> dict:
+    def advisory_evaluation(
+        self, skill_id: Optional[str] = None, observation: Optional[dict] = None
+    ) -> dict:
+        if observation is not None:
+            result = dict(observation)
+            result["advisory"] = True
+            return result
         report = self.check(skill_id)
         if not report["available"]:
             return report
         for skill in report["skills"]:
             skill["advisory"] = "local_content_drift" if skill["content_drift"] else "ok"
+        report["advisory"] = True
         return report
 
 
-__all__ = ["LIFECYCLE_STATUSES", "RELATIONS", "SkillWiki", "SkillWikiResult"]
+__all__ = [
+    "ALLOWED_TRANSITIONS",
+    "LIFECYCLE_STATUSES",
+    "RELATION_TYPES",
+    "RELATIONS",
+    "SkillWiki",
+    "SkillWikiResult",
+]

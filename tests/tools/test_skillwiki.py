@@ -165,9 +165,9 @@ def test_relations_and_transitions_keep_the_result_contract(tmp_path):
 
 
 _EXPECTED_TRANSITIONS = {
-    "raw": {"candidate", "archived"},
-    "candidate": {"draft", "deprecated", "archived"},
-    "draft": {"verified", "degraded", "deprecated", "archived"},
+    "raw": {"candidate", "degraded", "archived"},
+    "candidate": {"draft", "degraded", "archived"},
+    "draft": {"verified", "degraded", "archived"},
     "verified": {"release", "degraded", "deprecated", "archived"},
     "release": {"degraded", "deprecated", "archived"},
     "degraded": {"draft", "deprecated", "archived"},
@@ -323,3 +323,76 @@ def test_check_reports_malformed_local_path_without_raising(tmp_path, monkeypatc
 
     assert report["available"] is True
     assert report["skills"][0]["diagnostic"] == "local_path_unavailable"
+
+
+def test_relations_are_explicit_and_do_not_install_dependencies(tmp_path):
+    from tools.skillwiki import SkillWiki
+
+    wiki = SkillWiki(tmp_path / "provenance.db")
+    wiki.record_import(_bundle("a", "acme/a", {"SKILL.md": "# a"}), tmp_path / "a")
+    wiki.record_import(_bundle("b", "acme/b", {"SKILL.md": "# b"}), tmp_path / "b")
+
+    result = wiki.add_relation("github:acme/a:", "github:acme/b:", "depends_on")
+
+    assert result.available is True
+    assert result.value["inserted"] is True
+    assert wiki.list_relations("github:acme/a:").items[0]["relation"] == "depends_on"
+    assert not (tmp_path / "skills").exists()
+
+
+def test_relation_validation_happens_before_opening_a_write_transaction(tmp_path, monkeypatch):
+    from tools.skillwiki import SkillWiki
+
+    wiki = SkillWiki(tmp_path / "provenance.db")
+
+    def fail_if_opened(**_kwargs):
+        raise AssertionError("invalid relation opened a database transaction")
+
+    monkeypatch.setattr(wiki, "_connection", fail_if_opened)
+
+    result = wiki.add_relation("from", "to", "invalid")
+
+    assert result.available is False
+    assert result.reason == "invalid_relation"
+
+
+def test_duplicate_relation_reports_that_no_new_row_was_inserted(tmp_path):
+    from tools.skillwiki import SkillWiki
+
+    wiki = SkillWiki(tmp_path / "provenance.db")
+    wiki.record_import(_bundle("a", "acme/a", {"SKILL.md": "# a"}), tmp_path / "a")
+    first = wiki.add_relation("github:acme/a:", "github:acme/b:", "references")
+    second = wiki.add_relation("github:acme/a:", "github:acme/b:", "references")
+
+    assert first.value["inserted"] is True
+    assert second.value["inserted"] is False
+
+
+def test_check_reports_unresolved_relation_targets(tmp_path):
+    from tools.skillwiki import SkillWiki
+
+    wiki = SkillWiki(tmp_path / "provenance.db")
+    wiki.record_import(_bundle("a", "acme/a", {"SKILL.md": "# a"}), tmp_path / "a")
+    wiki.add_relation("github:acme/a:", "github:acme/missing:", "depends_on")
+
+    report = wiki.check()
+
+    assert report["unresolved_relations"] == [
+        {
+            "from_skill_id": "github:acme/a:",
+            "to_skill_id": "github:acme/missing:",
+            "relation": "depends_on",
+        }
+    ]
+
+
+def test_advisory_evaluation_returns_observation_without_transition(tmp_path):
+    from tools.skillwiki import SkillWiki
+
+    wiki = SkillWiki(tmp_path / "provenance.db")
+    wiki.record_import(_bundle("a", "acme/a", {"SKILL.md": "# a"}), tmp_path / "a")
+
+    result = wiki.advisory_evaluation("github:acme/a:", {"score": 1.0})
+
+    assert result == {"score": 1.0, "advisory": True}
+    assert wiki.get_skill("github:acme/a:").value["status"] == "raw"
