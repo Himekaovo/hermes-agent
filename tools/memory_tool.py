@@ -333,6 +333,52 @@ class MemoryStore:
             return self.user_char_limit
         return self.memory_char_limit
 
+    def _govern_mutation(
+        self,
+        target: str,
+        current_entries: List[str],
+        proposed_entries: List[str],
+        operation: str,
+    ) -> Dict[str, Any]:
+        """Run local governance and snapshot the current file before a write."""
+        from tools import memory_governance
+
+        memory_dir = get_memory_dir()
+        decision = memory_governance.preflight(
+            target=target,
+            current_entries=current_entries,
+            proposed_entries=proposed_entries,
+            operation=operation,
+            governance_dir=memory_dir / "governance",
+        )
+        if not decision.get("allowed"):
+            decision.pop("allowed", None)
+            decision["success"] = False
+            return decision
+
+        path = self._path_for(target)
+        snapshot_meta = None
+        if path.exists():
+            try:
+                snapshot_meta = memory_governance.snapshot(
+                    path,
+                    memory_dir / "l2" / "versions",
+                    target=target,
+                    reason=f"before {operation}",
+                    operation=operation,
+                )
+            except (OSError, UnicodeError) as exc:
+                return {
+                    "success": False,
+                    "gate": "version_backup_failed",
+                    "error": f"Could not back up {path.name} before write: {exc}",
+                }
+        return {
+            "success": True,
+            "metadata": snapshot_meta,
+            "recommendations": decision.get("recommendations", []),
+        }
+
     def add(self, target: str, content: str) -> Dict[str, Any]:
         """Append a new entry. Returns error if it would exceed the char limit."""
         content = content.strip()
@@ -379,11 +425,17 @@ class MemoryStore:
                     "usage": f"{current:,}/{limit:,}",
                 })
 
+            governance = self._govern_mutation(target, entries, new_entries, "add")
+            if not governance["success"]:
+                return governance
+
             entries.append(content)
             self._set_entries(target, entries)
             self.save_to_disk(target)
 
-        return self._success_response(target, "Entry added.")
+        response = self._success_response(target, "Entry added.")
+        response["governance"] = governance.get("metadata")
+        return response
 
     def replace(self, target: str, old_text: str, new_content: str) -> Dict[str, Any]:
         """Find entry containing old_text substring, replace it with new_content."""
@@ -448,11 +500,17 @@ class MemoryStore:
                     "usage": f"{current:,}/{limit:,}",
                 })
 
+            governance = self._govern_mutation(target, entries, test_entries, "replace")
+            if not governance["success"]:
+                return governance
+
             entries[idx] = new_content
             self._set_entries(target, entries)
             self.save_to_disk(target)
 
-        return self._success_response(target, "Entry replaced.")
+        response = self._success_response(target, "Entry replaced.")
+        response["governance"] = governance.get("metadata")
+        return response
 
     def remove(self, target: str, old_text: str) -> Dict[str, Any]:
         """Remove the entry containing old_text substring."""
@@ -488,11 +546,17 @@ class MemoryStore:
                 # All identical -- safe to remove just the first
 
             idx = matches[0][0]
+            proposed_entries = entries[:idx] + entries[idx + 1:]
+            governance = self._govern_mutation(target, entries, proposed_entries, "remove")
+            if not governance["success"]:
+                return governance
             entries.pop(idx)
             self._set_entries(target, entries)
             self.save_to_disk(target)
 
-        return self._success_response(target, "Entry removed.")
+        response = self._success_response(target, "Entry removed.")
+        response["governance"] = governance.get("metadata")
+        return response
 
     def apply_batch(self, target: str, operations: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Apply a sequence of add/replace/remove ops to one target atomically.
@@ -595,11 +659,19 @@ class MemoryStore:
                     "usage": f"{current:,}/{limit:,}",
                 })
 
+            governance = self._govern_mutation(
+                target, self._entries_for(target), working, "batch"
+            )
+            if not governance["success"]:
+                return governance
+
             # Commit.
             self._set_entries(target, working)
             self.save_to_disk(target)
 
-        return self._success_response(target, f"Applied {len(operations)} operation(s).")
+        response = self._success_response(target, f"Applied {len(operations)} operation(s).")
+        response["governance"] = governance.get("metadata")
+        return response
 
     def _batch_error(self, target: str, message: str) -> Dict[str, Any]:
         """Build a batch-abort error that reports live (uncommitted) state."""
@@ -1146,7 +1218,4 @@ registry.register(
     check_fn=check_memory_requirements,
     emoji="🧠",
 )
-
-
-
 

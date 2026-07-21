@@ -276,6 +276,14 @@ class TestMemoryStoreAdd:
         # the store's live state, which is the real contract.
         assert "Python 3.12 project" in store.memory_entries
 
+    def test_add_creates_prewrite_version_snapshot(self, store, tmp_path):
+        store.add("memory", "Python 3.12 project")
+        result = store.add("memory", "Project uses pytest for tests")
+        assert result["success"] is True
+        snapshots = list((tmp_path / "l2" / "versions").glob("*.md"))
+        assert snapshots
+        assert "Python 3.12 project" in snapshots[0].read_text(encoding="utf-8")
+
     def test_add_to_user(self, store):
         result = store.add("user", "Name: Alice")
         assert result["success"] is True
@@ -325,6 +333,17 @@ class TestMemoryStoreReplace:
         assert result["success"] is True
         assert "Python 3.12 project" in store.memory_entries
         assert "Python 3.11 project" not in store.memory_entries
+
+    def test_replace_and_remove_refuse_protected_entry(self, store):
+        path = store._path_for("memory")
+        path.write_text("critical rule\n<!-- SLOW_UPDATE -->", encoding="utf-8")
+        result = store.replace("memory", "critical", "changed durable rule")
+        assert result["success"] is False
+        assert result["gate"] == "protected_region"
+        assert "critical rule" in path.read_text(encoding="utf-8")
+        result = store.remove("memory", "critical")
+        assert result["success"] is False
+        assert result["gate"] == "protected_region"
 
     def test_replace_no_match(self, store):
         store.add("memory", "fact A")
@@ -684,6 +703,21 @@ class TestMemoryBatch:
         ))
         assert result["success"] is False
         assert "legit fact" not in store.memory_entries
+
+    def test_batch_protected_violation_is_atomic(self, store):
+        path = store._path_for("memory")
+        path.write_text("critical rule\n<!-- SLOW_UPDATE -->\n§\nordinary fact", encoding="utf-8")
+        result = store.apply_batch(
+            "memory",
+            [
+                {"action": "replace", "old_text": "critical", "content": "changed rule"},
+                {"action": "remove", "old_text": "ordinary"},
+            ],
+        )
+        assert result["success"] is False
+        assert result["gate"] == "protected_region"
+        assert "critical rule" in path.read_text(encoding="utf-8")
+        assert "ordinary fact" in path.read_text(encoding="utf-8")
 
 
 # =========================================================================
