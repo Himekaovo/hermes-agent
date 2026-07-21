@@ -226,3 +226,63 @@ def test_check_returns_a_diagnostic_when_local_hashing_is_unavailable(
     assert report["skills"][0]["content_drift"] is False
     assert report["skills"][0]["local_hash_available"] is False
     assert report["skills"][0]["diagnostic"] == "local_hash_unavailable"
+
+
+def test_check_does_not_create_missing_database(tmp_path):
+    from tools.skillwiki import SkillWiki
+
+    db = tmp_path / "missing" / "provenance.db"
+    report = SkillWiki(db).check()
+
+    assert report == {
+        "available": False,
+        "reason": "database_unavailable",
+        "skills": [],
+    }
+    assert not db.exists()
+
+
+def test_legacy_lifecycle_database_is_migrated(tmp_path):
+    from tools.skillwiki import SkillWiki
+
+    db = tmp_path / "provenance.db"
+    with sqlite3.connect(db) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE skills (
+                skill_id TEXT PRIMARY KEY, name TEXT NOT NULL, source TEXT NOT NULL,
+                repo TEXT, path TEXT, ref TEXT, commit_sha TEXT, source_url TEXT,
+                content_hash TEXT NOT NULL, imported_at TEXT NOT NULL, local_path TEXT NOT NULL,
+                local_modified_count INTEGER NOT NULL DEFAULT 0, version TEXT,
+                status TEXT NOT NULL CHECK (status IN ('raw', 'quarantined', 'verified', 'active', 'stale', 'archived', 'deprecated', 'rejected')),
+                metadata_json TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+            );
+            CREATE TABLE relations (from_skill_id TEXT NOT NULL, to_skill_id TEXT NOT NULL,
+                relation TEXT NOT NULL, created_at TEXT NOT NULL,
+                PRIMARY KEY (from_skill_id, to_skill_id, relation));
+            CREATE TABLE lifecycle_events (event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                skill_id TEXT NOT NULL, from_status TEXT NOT NULL, to_status TEXT NOT NULL,
+                actor TEXT NOT NULL, reason TEXT NOT NULL, created_at TEXT NOT NULL);
+            INSERT INTO skills VALUES
+                ('github:acme/demo:', 'demo', 'github', 'acme/demo', '', 'main', NULL, NULL,
+                 'sha256:abc', 'now', '/tmp/demo', 0, NULL, 'active', '{}', 'now', 'now');
+            """
+        )
+
+    result = SkillWiki(db).get_skill("github:acme/demo:")
+
+    assert result.available is True
+    assert result.value["status"] == "verified"
+
+
+def test_remove_relation_returns_value_record(tmp_path):
+    from tools.skillwiki import SkillWiki
+
+    wiki = SkillWiki(tmp_path / "provenance.db")
+    wiki.record_import(_bundle("demo", "acme/demo", {"SKILL.md": "# demo"}), tmp_path / "demo")
+    wiki.add_relation("github:acme/demo:", "github:acme/other:", "references")
+
+    result = wiki.remove_relation("github:acme/demo:", "github:acme/other:", "references")
+
+    assert result.available is True
+    assert result.value["removed"] is True

@@ -126,6 +126,12 @@ def _local_hash(path: Path) -> Optional[str]:
 
 def _row(row: sqlite3.Row) -> dict:
     result = dict(row)
+    result["status"] = {
+        "quarantined": "raw",
+        "active": "verified",
+        "stale": "degraded",
+        "rejected": "deprecated",
+    }.get(result.get("status"), result.get("status"))
     try:
         metadata = json.loads(result["metadata_json"])
     except (TypeError, ValueError, KeyError) as exc:
@@ -153,16 +159,61 @@ class SkillWiki:
         self.db_path = Path(db_path)
 
     @contextmanager
-    def _connection(self) -> Iterator[sqlite3.Connection]:
+    def _connection(self, *, initialize: bool = True) -> Iterator[sqlite3.Connection]:
         connection = sqlite3.connect(str(self.db_path), timeout=2)
         try:
             connection.row_factory = sqlite3.Row
             connection.execute("PRAGMA foreign_keys = ON")
-            connection.executescript(_SCHEMA)
+            if initialize:
+                self._initialize(connection)
             yield connection
-            connection.commit()
+            if initialize:
+                connection.commit()
         finally:
             connection.close()
+
+    @staticmethod
+    def _initialize(connection: sqlite3.Connection) -> None:
+        existing = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='skills'"
+        ).fetchone()
+        if existing and "'candidate'" not in (existing[0] or ""):
+            connection.execute("ALTER TABLE skills RENAME TO skills_legacy")
+            connection.execute("ALTER TABLE relations RENAME TO relations_legacy")
+            connection.execute("ALTER TABLE lifecycle_events RENAME TO lifecycle_events_legacy")
+        connection.executescript(_SCHEMA)
+        if not existing or "'candidate'" in (existing[0] or ""):
+            return
+        legacy_skills = connection.execute("SELECT * FROM skills_legacy").fetchall()
+        status_map = {
+            "quarantined": "raw",
+            "active": "verified",
+            "stale": "degraded",
+            "rejected": "deprecated",
+        }
+        for row in legacy_skills:
+            values = dict(row)
+            values["status"] = status_map.get(values["status"], values["status"])
+            connection.execute(
+                """INSERT INTO skills
+                (skill_id, name, source, repo, path, ref, commit_sha, source_url,
+                 content_hash, imported_at, local_path, local_modified_count, version,
+                 status, metadata_json, created_at, updated_at)
+                VALUES (:skill_id, :name, :source, :repo, :path, :ref, :commit_sha,
+                        :source_url, :content_hash, :imported_at, :local_path,
+                        :local_modified_count, :version, :status, :metadata_json,
+                        :created_at, :updated_at)""",
+                values,
+            )
+        for table in ("relations", "lifecycle_events"):
+            connection.execute(
+                f"INSERT INTO {table} SELECT * FROM {table}_legacy"
+            )
+        connection.executescript(
+            "DROP TABLE lifecycle_events_legacy; "
+            "DROP TABLE relations_legacy; "
+            "DROP TABLE skills_legacy;"
+        )
 
     @staticmethod
     def _unavailable() -> SkillWikiResult:
@@ -236,8 +287,10 @@ class SkillWiki:
             return self._unavailable()
 
     def get_skill(self, skill_id: str) -> SkillWikiResult:
+        if not self.db_path.exists():
+            return self._unavailable()
         try:
-            with self._connection() as db:
+            with self._connection(initialize=False) as db:
                 row = db.execute("SELECT * FROM skills WHERE skill_id = ?", (skill_id,)).fetchone()
                 value = _row(row) if row else None
                 return SkillWikiResult(True, items=[value] if value else [], value=value)
@@ -245,8 +298,10 @@ class SkillWiki:
             return self._unavailable()
 
     def list_skills(self) -> SkillWikiResult:
+        if not self.db_path.exists():
+            return self._unavailable()
         try:
-            with self._connection() as db:
+            with self._connection(initialize=False) as db:
                 rows = db.execute("SELECT * FROM skills ORDER BY skill_id").fetchall()
                 return SkillWikiResult(True, items=[_row(row) for row in rows])
         except (sqlite3.Error, OSError, ValueError, TypeError, KeyError):
@@ -273,7 +328,9 @@ class SkillWiki:
                     "DELETE FROM relations WHERE from_skill_id=? AND to_skill_id=? AND relation=?",
                     (from_skill_id, to_skill_id, relation),
                 )
-                return SkillWikiResult(True, items=[{"removed": cursor.rowcount > 0}])
+                item = {"removed": cursor.rowcount > 0, "from_skill_id": from_skill_id,
+                        "to_skill_id": to_skill_id, "relation": relation}
+                return SkillWikiResult(True, items=[item], value=item)
         except (sqlite3.Error, OSError, ValueError, TypeError, KeyError):
             return self._unavailable()
 
@@ -308,7 +365,7 @@ class SkillWiki:
                 current = db.execute("SELECT * FROM skills WHERE skill_id=?", (skill_id,)).fetchone()
                 if current is None:
                     return SkillWikiResult(False, "skill_not_found")
-                if to_status not in ALLOWED_TRANSITIONS[current["status"]]:
+                if to_status not in ALLOWED_TRANSITIONS.get(current["status"], set()):
                     return SkillWikiResult(False, "invalid_transition")
                 now = _now()
                 db.execute("UPDATE skills SET status=?, updated_at=? WHERE skill_id=?", (to_status, now, skill_id))
@@ -322,7 +379,10 @@ class SkillWiki:
             return self._unavailable()
 
     def check(self, skill_id: Optional[str] = None) -> dict:
-        result = self.list_skills() if skill_id is None else self.get_skill(skill_id)
+        try:
+            result = self.list_skills() if skill_id is None else self.get_skill(skill_id)
+        except (sqlite3.Error, OSError):
+            return {"available": False, "reason": "database_unavailable", "skills": []}
         if not result.available:
             return {"available": False, "reason": result.reason, "skills": []}
         skills = result.items
