@@ -58,6 +58,30 @@ def test_delete_memory_rewrites_file(home):
     assert "beta note" in remaining
 
 
+def test_journey_delete_creates_memory_snapshot(home):
+    assert lm.delete_node("memory:memory:0")["ok"]
+    versions = home / "memories" / "l2" / "versions"
+    snapshots = list(versions.glob("*.md"))
+    assert snapshots
+    assert "alpha note" in snapshots[0].read_text(encoding="utf-8")
+
+
+def test_journey_edit_refuses_protected_memory(home):
+    path = home / "memories" / "MEMORY.md"
+    path.write_text("alpha note\n<!-- SLOW_UPDATE -->\n§\nbeta note", encoding="utf-8")
+    result = lm.edit_node("memory:memory:0", "rewritten protected note")
+    assert not result["ok"]
+    assert "protected" in result["message"]
+
+
+def test_journey_delete_refuses_protected_memory(home):
+    path = home / "memories" / "MEMORY.md"
+    path.write_text("alpha note\n<!-- SLOW_UPDATE -->\n§\nbeta note", encoding="utf-8")
+    result = lm.delete_node("memory:memory:0")
+    assert not result["ok"]
+    assert "protected" in result["message"]
+
+
 def test_edit_memory_replaces_chunk(home):
     assert lm.edit_node("memory:profile:2", "rewritten profile")["ok"]
     assert (home / "memories" / "USER.md").read_text(encoding="utf-8").strip() == "rewritten profile"

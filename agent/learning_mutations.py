@@ -145,7 +145,11 @@ def _delete_memory(node_id: str) -> dict[str, Any]:
     source, gidx = _parse_memory_id(node_id)
     path, chunks, local = _locate_memory(source, gidx)
 
-    del chunks[local]
+    proposed = chunks[:local] + chunks[local + 1:]
+    governed = _govern_memory_change(path, chunks, proposed, "journey_delete")
+    if not governed["ok"]:
+        return governed
+    chunks = proposed
     _write_memory(path, chunks)
 
     return {"ok": True, "message": f"deleted memory from {path.name}"}
@@ -180,13 +184,55 @@ def _edit_memory(node_id: str, content: str) -> dict[str, Any]:
         return {"ok": False, "message": "empty memory — use delete to remove it"}
     path, chunks, local = _locate_memory(source, gidx)
 
-    chunks[local] = body
+    proposed = chunks.copy()
+    proposed[local] = body
+    governed = _govern_memory_change(path, chunks, proposed, "journey_edit")
+    if not governed["ok"]:
+        return governed
+    chunks = proposed
     _write_memory(path, chunks)
 
     return {"ok": True, "message": f"updated memory in {path.name}"}
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
+
+
+def _govern_memory_change(
+    path: Path,
+    current: list[str],
+    proposed: list[str],
+    operation: str,
+) -> dict[str, Any]:
+    from tools import memory_governance
+
+    target = "user" if path.name == "USER.md" else "memory"
+    memory_dir = path.parent
+    decision = memory_governance.preflight(
+        target=target,
+        current_entries=current,
+        proposed_entries=proposed,
+        operation=operation,
+        governance_dir=memory_dir / "governance",
+    )
+    if not decision.get("allowed"):
+        return {
+            "ok": False,
+            "message": f"memory write blocked by {decision.get('gate', 'governance')}: "
+            f"{decision.get('error') or decision.get('gate', 'policy violation')}",
+        }
+    try:
+        if path.exists():
+            memory_governance.snapshot(
+                path,
+                memory_dir / "l2" / "versions",
+                target=target,
+                reason=f"before {operation}",
+                operation=operation,
+            )
+    except (OSError, UnicodeError) as exc:
+        return {"ok": False, "message": f"memory write blocked by version_backup_failed: {exc}"}
+    return {"ok": True}
 
 
 def _write_memory(path: Path, chunks: list[str]) -> None:

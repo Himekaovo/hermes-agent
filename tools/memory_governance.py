@@ -239,9 +239,28 @@ def preflight(
         return {**base, "allowed": False, "gate": "quality"}
 
     conflicts: list[dict[str, Any]] = []
-    for index, proposed in enumerate(proposed_entries):
-        if index < len(current_entries) and proposed == current_entries[index]:
-            continue
+    if operation in {"remove", "journey_delete"}:
+        candidates: list[tuple[int, str]] = []
+    elif operation in {"replace", "journey_edit"}:
+        candidates = [
+            (index, proposed)
+            for index, proposed in enumerate(proposed_entries)
+            if index >= len(current_entries) or proposed != current_entries[index]
+        ]
+    else:
+        if operation == "add":
+            candidates = [
+                (index, proposed)
+                for index, proposed in enumerate(proposed_entries)
+                if index >= len(current_entries)
+            ]
+        else:
+            candidates = [
+                (index, proposed)
+                for index, proposed in enumerate(proposed_entries)
+                if proposed not in current_entries
+            ]
+    for index, proposed in candidates:
         for old_index, existing in enumerate(current_entries):
             similarity = _similarity(existing, proposed)
             if len(_tokens(existing)) >= 2 and len(_tokens(proposed)) >= 2 and similarity >= 0.82:
