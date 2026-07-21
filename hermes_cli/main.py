@@ -13050,7 +13050,11 @@ def _try_termux_fast_tui_launch() -> bool:
 
 def cmd_memory(args):
     sub = getattr(args, "memory_command", None)
-    if sub == "off":
+    if sub in {"versions", "step", "meta"}:
+        from hermes_cli.subcommands.memory import handle_governance_command
+
+        handle_governance_command(args)
+    elif sub == "off":
         from hermes_cli.config import load_config, save_config
 
         config = load_config()
