@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator, Optional
+from urllib.parse import quote
 
 try:
     from tools.skills_hub import SkillBundle, bundle_content_hash, source_url_for_bundle
@@ -30,6 +31,7 @@ LIFECYCLE_STATUSES = (
     "archived",
 )
 RELATIONS = ("inspired_by", "depends_on", "references")
+_STATUS_CHECK_SQL = "status IN (" + ", ".join(repr(status) for status in LIFECYCLE_STATUSES) + ")"
 
 ALLOWED_TRANSITIONS = {
     "raw": {"candidate", "archived"},
@@ -159,15 +161,21 @@ class SkillWiki:
         self.db_path = Path(db_path)
 
     @contextmanager
-    def _connection(self, *, initialize: bool = True) -> Iterator[sqlite3.Connection]:
-        connection = sqlite3.connect(str(self.db_path), timeout=2)
+    def _connection(
+        self, *, initialize: bool = True, read_only: bool = False
+    ) -> Iterator[sqlite3.Connection]:
+        if read_only:
+            uri = f"file:{quote(str(self.db_path), safe='/')}?mode=ro"
+            connection = sqlite3.connect(uri, uri=True, timeout=2)
+        else:
+            connection = sqlite3.connect(str(self.db_path), timeout=2)
         try:
             connection.row_factory = sqlite3.Row
             connection.execute("PRAGMA foreign_keys = ON")
             if initialize:
                 self._initialize(connection)
             yield connection
-            if initialize:
+            if initialize and not read_only:
                 connection.commit()
         finally:
             connection.close()
@@ -177,12 +185,13 @@ class SkillWiki:
         existing = connection.execute(
             "SELECT sql FROM sqlite_master WHERE type='table' AND name='skills'"
         ).fetchone()
-        if existing and "'candidate'" not in (existing[0] or ""):
+        schema_sql = (existing[0] or "") if existing else ""
+        if existing and _STATUS_CHECK_SQL not in schema_sql:
             connection.execute("ALTER TABLE skills RENAME TO skills_legacy")
             connection.execute("ALTER TABLE relations RENAME TO relations_legacy")
             connection.execute("ALTER TABLE lifecycle_events RENAME TO lifecycle_events_legacy")
         connection.executescript(_SCHEMA)
-        if not existing or "'candidate'" in (existing[0] or ""):
+        if not existing or _STATUS_CHECK_SQL in schema_sql:
             return
         legacy_skills = connection.execute("SELECT * FROM skills_legacy").fetchall()
         status_map = {
@@ -205,9 +214,16 @@ class SkillWiki:
                         :created_at, :updated_at)""",
                 values,
             )
-        for table in ("relations", "lifecycle_events"):
+        connection.execute("INSERT INTO relations SELECT * FROM relations_legacy")
+        for row in connection.execute("SELECT * FROM lifecycle_events_legacy").fetchall():
+            values = dict(row)
+            values["from_status"] = status_map.get(values["from_status"], values["from_status"])
+            values["to_status"] = status_map.get(values["to_status"], values["to_status"])
             connection.execute(
-                f"INSERT INTO {table} SELECT * FROM {table}_legacy"
+                """INSERT INTO lifecycle_events
+                (skill_id, from_status, to_status, actor, reason, created_at)
+                VALUES (:skill_id, :from_status, :to_status, :actor, :reason, :created_at)""",
+                values,
             )
         connection.executescript(
             "DROP TABLE lifecycle_events_legacy; "
@@ -290,7 +306,7 @@ class SkillWiki:
         if not self.db_path.exists():
             return self._unavailable()
         try:
-            with self._connection(initialize=False) as db:
+            with self._connection(initialize=False, read_only=True) as db:
                 row = db.execute("SELECT * FROM skills WHERE skill_id = ?", (skill_id,)).fetchone()
                 value = _row(row) if row else None
                 return SkillWikiResult(True, items=[value] if value else [], value=value)
@@ -301,7 +317,7 @@ class SkillWiki:
         if not self.db_path.exists():
             return self._unavailable()
         try:
-            with self._connection(initialize=False) as db:
+            with self._connection(initialize=False, read_only=True) as db:
                 rows = db.execute("SELECT * FROM skills ORDER BY skill_id").fetchall()
                 return SkillWikiResult(True, items=[_row(row) for row in rows])
         except (sqlite3.Error, OSError, ValueError, TypeError, KeyError):
@@ -338,7 +354,7 @@ class SkillWiki:
         if not self.db_path.exists():
             return self._unavailable()
         try:
-            with self._connection(initialize=False) as db:
+            with self._connection(initialize=False, read_only=True) as db:
                 if skill_id is None:
                     rows = db.execute("SELECT * FROM relations ORDER BY from_skill_id, to_skill_id, relation").fetchall()
                 else:

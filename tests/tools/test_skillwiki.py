@@ -266,6 +266,9 @@ def test_legacy_lifecycle_database_is_migrated(tmp_path):
             INSERT INTO skills VALUES
                 ('github:acme/demo:', 'demo', 'github', 'acme/demo', '', 'main', NULL, NULL,
                  'sha256:abc', 'now', '/tmp/demo', 0, NULL, 'active', '{}', 'now', 'now');
+            INSERT INTO lifecycle_events
+                (skill_id, from_status, to_status, actor, reason, created_at)
+                VALUES ('github:acme/demo:', 'quarantined', 'active', 'legacy', 'imported', 'now');
             """
         )
 
@@ -273,6 +276,12 @@ def test_legacy_lifecycle_database_is_migrated(tmp_path):
 
     assert result.available is True
     assert result.value["status"] == "verified"
+    assert SkillWiki(db).transition("github:acme/demo:", "release", actor="test").available
+    with sqlite3.connect(db) as connection:
+        event = connection.execute(
+            "SELECT from_status, to_status FROM lifecycle_events"
+        ).fetchone()
+    assert event == ("raw", "verified")
 
 
 def test_remove_relation_returns_value_record(tmp_path):
