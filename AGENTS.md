@@ -1006,7 +1006,18 @@ Roles:
 Key config knobs (under `delegation:` in `config.yaml`):
 `max_concurrent_children`, `max_spawn_depth`, `child_timeout_seconds`,
 `orchestrator_enabled`, `subagent_auto_approve`, `inherit_mcp_toolsets`,
-`max_iterations`.
+`max_iterations`, `max_retries`, `retry_backoff_seconds`.
+
+Recovery policy: soft failures (timeout, transient network/transport errors,
+empty responses, and temporary tool errors) are retried up to
+`delegation.max_retries` (default 2) with exponential backoff starting at
+`delegation.retry_backoff_seconds` (default 1 second). Hard failures
+(interruption, max-iteration exhaustion, unavailable tools, and unknown
+errors) are not retried. Every attempted task returns `attempts`,
+`attempt_history`, `failure_class`, and, when recovery is exhausted, a
+structured `fallback` with `reason_code`, `message`, and `next_action`.
+The legacy status is preserved for compatibility and `recovery_status` is set
+to `final_failed` for terminal failures.
 
 Durability rule: background `delegate_task` is detached from the current
 turn but still process-local. For work that must survive process restart, use

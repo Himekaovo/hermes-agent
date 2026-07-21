@@ -35,6 +35,10 @@ from tools.delegate_tool import (
     _resolve_child_credential_pool,
     _resolve_delegation_credentials,
     _inherit_parent_base_url,
+    _classify_delegate_failure,
+    _get_max_retries,
+    _get_retry_backoff_seconds,
+    _run_delegate_with_retries,
 )
 
 
@@ -87,6 +91,104 @@ class TestDelegateRequirements(unittest.TestCase):
         self.assertNotIn("acp_command", props["tasks"]["items"]["properties"])
         self.assertNotIn("acp_args", props["tasks"]["items"]["properties"])
         self.assertNotIn("maxItems", props["tasks"])  # removed — limit is now runtime-configurable
+
+
+class TestDelegateFailurePolicy(unittest.TestCase):
+    def test_classifies_recoverable_failures_as_soft(self):
+        for entry, reason in (
+            ({"status": "timeout", "error": "network timeout"}, "timeout"),
+            ({"status": "error", "error": "connection reset by peer"}, "network_error"),
+            ({"status": "failed", "summary": "", "exit_reason": "completed"}, "empty_response"),
+        ):
+            self.assertEqual(_classify_delegate_failure(entry), ("soft", reason))
+
+    def test_classifies_nonrecoverable_failures_as_hard(self):
+        self.assertEqual(
+            _classify_delegate_failure(
+                {"status": "failed", "exit_reason": "max_iterations", "error": "budget"}
+            ),
+            ("hard", "max_iterations"),
+        )
+        self.assertEqual(
+            _classify_delegate_failure(
+                {"status": "interrupted", "error": "cancelled"}
+            ),
+            ("hard", "interrupted"),
+        )
+        self.assertEqual(
+            _classify_delegate_failure(
+                {"status": "error", "error": "tool unavailable: browser"}
+            ),
+            ("hard", "tool_unavailable"),
+        )
+
+    def test_retry_config_is_bounded_and_has_defaults(self):
+        with patch("tools.delegate_tool._load_config", return_value={}):
+            self.assertEqual(_get_max_retries(), 2)
+            self.assertEqual(_get_retry_backoff_seconds(), 1.0)
+        with patch(
+            "tools.delegate_tool._load_config",
+            return_value={"max_retries": -4, "retry_backoff_seconds": -1},
+        ):
+            self.assertEqual(_get_max_retries(), 0)
+            self.assertEqual(_get_retry_backoff_seconds(), 0.0)
+
+
+class TestDelegateRecovery(unittest.TestCase):
+    def test_soft_failure_retries_then_returns_success_with_history(self):
+        outcomes = iter(
+            [
+                {"task_index": 0, "status": "timeout", "summary": None, "error": "timed out"},
+                {"task_index": 0, "status": "completed", "summary": "recovered"},
+            ]
+        )
+        with patch("tools.delegate_tool._run_single_child", side_effect=lambda *a, **k: next(outcomes)), \
+             patch("tools.delegate_tool._get_max_retries", return_value=2), \
+             patch("tools.delegate_tool._get_retry_backoff_seconds", return_value=0):
+            result = _run_delegate_with_retries(
+                0, "recover", [object(), object()], _make_mock_parent()
+            )
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["summary"], "recovered")
+        self.assertEqual(result["attempts"], 2)
+        self.assertEqual(len(result["attempt_history"]), 2)
+        self.assertEqual(result["attempt_history"][0]["reason_code"], "timeout")
+        self.assertEqual(result["failure_class"], "none")
+
+    def test_soft_failure_exhaustion_returns_structured_fallback(self):
+        failure = {"task_index": 0, "status": "timeout", "summary": None, "error": "timed out"}
+        with patch("tools.delegate_tool._run_single_child", return_value=failure), \
+             patch("tools.delegate_tool._get_max_retries", return_value=1), \
+             patch("tools.delegate_tool._get_retry_backoff_seconds", return_value=0):
+            result = _run_delegate_with_retries(
+                0, "recover", [object(), object()], _make_mock_parent()
+            )
+
+        self.assertEqual(result["attempts"], 2)
+        self.assertEqual(result["recovery_status"], "final_failed")
+        self.assertEqual(result["failure_class"], "soft")
+        self.assertEqual(result["fallback"]["reason_code"], "timeout")
+        self.assertIn("next_action", result["fallback"])
+
+    def test_hard_failure_does_not_retry(self):
+        failure = {
+            "task_index": 0,
+            "status": "failed",
+            "summary": None,
+            "error": "budget exhausted",
+            "exit_reason": "max_iterations",
+        }
+        with patch("tools.delegate_tool._run_single_child", return_value=failure) as run, \
+             patch("tools.delegate_tool._get_max_retries", return_value=3):
+            result = _run_delegate_with_retries(
+                0, "stop", [object(), object(), object(), object()], _make_mock_parent()
+            )
+
+        run.assert_called_once()
+        self.assertEqual(result["attempts"], 1)
+        self.assertEqual(result["recovery_status"], "final_failed")
+        self.assertEqual(result["fallback"]["reason_code"], "max_iterations")
 
     def test_schema_description_advertises_runtime_limits(self):
         """The model must see the user's actual concurrency / spawn-depth caps,
@@ -331,6 +433,25 @@ class TestDelegateTask(unittest.TestCase):
         self.assertEqual(result["results"][0]["status"], "completed")
         self.assertEqual(result["results"][0]["summary"], "Done!")
         mock_run.assert_called_once()
+
+    @patch("tools.delegate_tool._get_max_retries", return_value=1)
+    @patch("tools.delegate_tool._build_child_agent")
+    @patch("tools.delegate_tool._run_single_child")
+    def test_single_task_soft_failure_builds_fresh_retry_child(
+        self, mock_run, mock_build, _mock_retries
+    ):
+        mock_build.side_effect = [MagicMock(), MagicMock()]
+        mock_run.side_effect = [
+            {"task_index": 0, "status": "timeout", "summary": None, "error": "timed out"},
+            {"task_index": 0, "status": "completed", "summary": "Recovered"},
+        ]
+        parent = _make_mock_parent()
+        result = json.loads(delegate_task(goal="Recover task", parent_agent=parent))
+
+        self.assertEqual(result["results"][0]["status"], "completed")
+        self.assertEqual(result["results"][0]["attempts"], 2)
+        self.assertEqual(mock_build.call_count, 2)
+        self.assertEqual(mock_run.call_count, 2)
 
     @patch("tools.delegate_tool._run_single_child")
     def test_batch_mode(self, mock_run):

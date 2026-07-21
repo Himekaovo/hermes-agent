@@ -335,6 +335,50 @@ def _looks_like_error_output(content: Any) -> bool:
     )
 
 
+def _classify_delegate_failure(entry_or_error: Any) -> tuple[str, str]:
+    """Classify a child result into a bounded recovery policy.
+
+    This is deliberately deterministic: retry decisions must not depend on a
+    model-generated explanation or on the child having produced a summary.
+    """
+    if isinstance(entry_or_error, BaseException):
+        text = str(entry_or_error)
+        status = "error"
+        exit_reason = ""
+    elif isinstance(entry_or_error, dict):
+        text = str(entry_or_error.get("error") or entry_or_error.get("summary") or "")
+        status = str(entry_or_error.get("status") or "").strip().lower()
+        exit_reason = str(entry_or_error.get("exit_reason") or "").strip().lower()
+    else:
+        text = str(entry_or_error or "")
+        status = "error"
+        exit_reason = ""
+
+    lowered = text.lower()
+    if status == "interrupted" or exit_reason == "interrupted":
+        return "hard", "interrupted"
+    if exit_reason == "max_iterations":
+        return "hard", "max_iterations"
+    if any(marker in lowered for marker in ("tool unavailable", "tool not found", "unknown tool")):
+        return "hard", "tool_unavailable"
+    if status == "timeout" or exit_reason == "timeout":
+        return "soft", "timeout"
+    if any(marker in lowered for marker in ("timeout", "timed out")):
+        return "soft", "timeout"
+    if any(marker in lowered for marker in ("connection", "network", "rate limit", "429", "temporarily unavailable")):
+        return "soft", "network_error"
+    if (
+        isinstance(entry_or_error, dict)
+        and not text.strip()
+        and not str(entry_or_error.get("summary") or "").strip()
+    ):
+        if status in {"failed", "error", "completed", ""}:
+            return "soft", "empty_response"
+    if status in {"completed", "succeeded"} and text.strip():
+        return "none", "none"
+    return "hard", "unknown_error"
+
+
 def _normalize_role(r: Optional[str]) -> str:
     """Normalise a caller-provided role to 'leaf' or 'orchestrator'.
 
@@ -463,6 +507,40 @@ def _get_child_timeout() -> Optional[float]:
         else:
             return None if parsed <= 0 else max(30.0, parsed)
     return DEFAULT_CHILD_TIMEOUT
+
+
+DEFAULT_MAX_RETRIES = 2
+DEFAULT_RETRY_BACKOFF_SECONDS = 1.0
+
+
+def _get_max_retries() -> int:
+    """Read the operator-controlled number of retries for soft failures."""
+    value = _load_config().get("max_retries", DEFAULT_MAX_RETRIES)
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        logger.warning(
+            "delegation.max_retries=%r is invalid; using default %d",
+            value,
+            DEFAULT_MAX_RETRIES,
+        )
+        return DEFAULT_MAX_RETRIES
+
+
+def _get_retry_backoff_seconds() -> float:
+    """Read the non-negative base delay used by exponential retry backoff."""
+    value = _load_config().get(
+        "retry_backoff_seconds", DEFAULT_RETRY_BACKOFF_SECONDS
+    )
+    try:
+        return max(0.0, float(value))
+    except (TypeError, ValueError):
+        logger.warning(
+            "delegation.retry_backoff_seconds=%r is invalid; using default %.1f",
+            value,
+            DEFAULT_RETRY_BACKOFF_SECONDS,
+        )
+        return DEFAULT_RETRY_BACKOFF_SECONDS
 
 
 def _get_max_spawn_depth() -> int:
@@ -2400,6 +2478,117 @@ def _run_single_child(
             logger.debug("Failed to close child agent after delegation")
 
 
+def _run_delegate_with_retries(
+    task_index: int,
+    goal: str,
+    child_attempts: Any,
+    parent_agent=None,
+) -> Dict[str, Any]:
+    """Run one delegated task with bounded recovery around single attempts.
+
+    ``child_attempts`` is pre-built by the parent thread because child agent
+    construction mutates process-global tool resolution state. Each child is
+    used at most once; this also guarantees a failed session is never reused.
+    """
+    if not child_attempts:
+        return {
+            "task_index": task_index,
+            "status": "error",
+            "summary": None,
+            "error": "No child agent was prepared for delegation.",
+            "recovery_status": "final_failed",
+            "failure_class": "hard",
+            "attempts": 0,
+            "attempt_history": [],
+            "fallback": {
+                "reason_code": "child_unavailable",
+                "failure_class": "hard",
+                "message": "The delegated child could not be constructed.",
+                "next_action": "Inspect delegation startup and credential configuration.",
+            },
+        }
+
+    if callable(child_attempts):
+        max_attempts = 1 + _get_max_retries()
+    else:
+        max_attempts = min(len(child_attempts), 1 + _get_max_retries())
+    history: List[Dict[str, Any]] = []
+    last_result: Dict[str, Any] = {}
+
+    for attempt_number in range(max_attempts):
+        child = (
+            child_attempts(attempt_number)
+            if callable(child_attempts)
+            else child_attempts[attempt_number]
+        )
+        try:
+            result = _run_single_child(task_index, goal, child, parent_agent)
+        except Exception as exc:
+            result = {
+                "task_index": task_index,
+                "status": "error",
+                "summary": None,
+                "error": str(exc),
+                "duration_seconds": 0.0,
+            }
+        last_result = dict(result)
+        failure_class, reason_code = _classify_delegate_failure(result)
+        history.append(
+            {
+                "attempt": attempt_number + 1,
+                "status": result.get("status"),
+                "failure_class": failure_class,
+                "reason_code": reason_code,
+                "exit_reason": result.get("exit_reason"),
+                "error": str(result.get("error") or "")[:1000],
+                "duration_seconds": result.get("duration_seconds", 0),
+            }
+        )
+
+        if failure_class == "none":
+            last_result.update(
+                {
+                    "failure_class": "none",
+                    "attempts": attempt_number + 1,
+                    "attempt_history": history,
+                }
+            )
+            return last_result
+
+        retries_remaining = max_attempts - attempt_number - 1
+        if failure_class != "soft" or retries_remaining <= 0:
+            message = str(result.get("error") or result.get("summary") or reason_code)
+            next_action = {
+                "timeout": "Retry later or increase delegation.child_timeout_seconds.",
+                "network_error": "Check provider connectivity and credentials before retrying.",
+                "empty_response": "Inspect the provider response path and retry with a healthy model.",
+                "max_iterations": "Split the task or raise delegation.max_iterations deliberately.",
+                "interrupted": "Resume the task after the parent interruption is cleared.",
+                "tool_unavailable": "Enable or replace the unavailable tool.",
+            }.get(reason_code, "Inspect the structured error and choose a different execution path.")
+            last_result.update(
+                {
+                    "recovery_status": "final_failed",
+                    "failure_class": failure_class,
+                    "attempts": attempt_number + 1,
+                    "attempt_history": history,
+                    "fallback": {
+                        "reason_code": reason_code,
+                        "failure_class": failure_class,
+                        "message": message[:2000],
+                        "next_action": next_action,
+                    },
+                }
+            )
+            return last_result
+
+        delay = _get_retry_backoff_seconds() * (2 ** attempt_number)
+        if delay > 0:
+            time.sleep(delay)
+
+    return last_result
+
+
 def _recover_tasks_from_json_string(
     tasks: Any,
 ) -> tuple[Optional[List[Dict[str, Any]]], Optional[str]]:
@@ -2581,45 +2770,60 @@ def delegate_task(
     # Wrapped in try/finally so the global is always restored even if a
     # child build raises (otherwise _last_resolved_tool_names stays corrupted).
     children = []
+    child_factories: Dict[int, Any] = {}
+    _child_build_lock = threading.Lock()
     try:
         for i, t in enumerate(task_list):
             # Per-task role beats top-level; normalise again so unknown
             # per-task values warn and degrade to leaf uniformly.
             effective_role = _normalize_role(t.get("role") or top_role)
-            child = _build_child_agent(
-                task_index=i,
-                goal=t["goal"],
-                context=t.get("context"),
-                # Subagents always inherit the parent's toolsets; the model
-                # cannot choose or narrow them (no model-facing toolsets arg).
-                toolsets=None,
-                model=creds["model"],
-                max_iterations=effective_max_iter,
-                task_count=n_tasks,
-                parent_agent=parent_agent,
-                override_provider=creds["provider"],
-                override_base_url=creds["base_url"],
-                override_api_key=creds["api_key"],
-                override_api_mode=creds["api_mode"],
-                override_request_overrides=creds.get("request_overrides"),
-                override_max_tokens=creds.get("max_output_tokens"),
-                override_acp_command=creds.get("command"),
-                override_acp_args=creds.get("args"),
-                role=effective_role,
-            )
-            # Override with correct parent tool names (before child construction mutated global)
-            child._delegate_saved_tool_names = _parent_tool_names
-            # Tee the child's progress events into its live transcript log.
-            # wrap_progress_callback preserves the inner callback contract
-            # (including the _flush attribute) and never lets writer failures
-            # reach the agent loop. When no parent display exists the inner
-            # callback is None and the wrapper still records events.
             _writer = live_writers[i] if i < len(live_writers) else None
-            if _writer is not None:
-                child.tool_progress_callback = wrap_progress_callback(
-                    getattr(child, "tool_progress_callback", None), _writer
-                )
-                child._live_transcript_path = str(_writer.path)
+
+            def _build_attempt(
+                _attempt: int = 0,
+                *,
+                _i: int = i,
+                _task: Dict[str, Any] = t,
+                _role: str = effective_role,
+                _writer: Any = _writer,
+            ):
+                # Construction is serialized because AIAgent creation updates
+                # model_tools' process-global resolved-tool snapshot.
+                with _child_build_lock:
+                    child = _build_child_agent(
+                        task_index=_i,
+                        goal=_task["goal"],
+                        context=_task.get("context"),
+                        # Subagents always inherit the parent's toolsets; the model
+                        # cannot choose or narrow them (no model-facing toolsets arg).
+                        toolsets=None,
+                        model=creds["model"],
+                        max_iterations=effective_max_iter,
+                        task_count=n_tasks,
+                        parent_agent=parent_agent,
+                        override_provider=creds["provider"],
+                        override_base_url=creds["base_url"],
+                        override_api_key=creds["api_key"],
+                        override_api_mode=creds["api_mode"],
+                        override_request_overrides=creds.get("request_overrides"),
+                        override_max_tokens=creds.get("max_output_tokens"),
+                        override_acp_command=creds.get("command"),
+                        override_acp_args=creds.get("args"),
+                        role=_role,
+                    )
+                    child._delegate_saved_tool_names = _parent_tool_names
+                    if _writer is not None:
+                        child.tool_progress_callback = wrap_progress_callback(
+                            getattr(child, "tool_progress_callback", None), _writer
+                        )
+                        child._live_transcript_path = str(_writer.path)
+                    return child
+
+            child = _build_attempt()
+            child_factories[i] = (
+                lambda attempt, _initial=child, _builder=_build_attempt:
+                _initial if attempt == 0 else _builder(attempt)
+            )
             children.append((i, t, child))
     finally:
         # Authoritative restore: reset global to parent's tool names after all children built
@@ -2638,7 +2842,9 @@ def delegate_task(
         if n_tasks == 1:
             # Single task -- run directly (no thread pool overhead)
             _i, _t, child = children[0]
-            result = _run_single_child(_i, _t["goal"], child, parent_agent)
+            result = _run_delegate_with_retries(
+                _i, _t["goal"], child_factories[_i], parent_agent
+            )
             results.append(result)
         else:
             # Batch -- run in parallel with per-task progress lines
@@ -2653,10 +2859,10 @@ def delegate_task(
                 futures = {}
                 for i, t, child in children:
                     future = executor.submit(
-                        _run_single_child,
+                        _run_delegate_with_retries,
                         task_index=i,
                         goal=t["goal"],
-                        child=child,
+                        child_attempts=child_factories[i],
                         parent_agent=parent_agent,
                     )
                     futures[future] = i

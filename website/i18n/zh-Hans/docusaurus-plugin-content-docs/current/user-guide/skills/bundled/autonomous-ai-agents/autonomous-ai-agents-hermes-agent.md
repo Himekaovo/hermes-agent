@@ -636,6 +636,8 @@ terminal(command="tmux new-session -d -s resumed 'hermes --resume 20260225_14305
 - **单个：** `delegate_task(goal, context)`。
 - **批量：** `delegate_task(tasks=[{goal, ...}, ...])` 并行运行子任务，上限由 `delegation.max_concurrent_children`（默认 3）控制。
 - **角色：** `leaf`（默认；不能再委派）vs `orchestrator`（可以生成自己的 worker，受 `delegation.max_spawn_depth` 限制）。
+- **失败恢复：** timeout、临时网络/传输错误、空响应和临时工具错误属于软失败，最多按 `delegation.max_retries`（默认 2）有限重试，并按 `delegation.retry_backoff_seconds`（默认 1 秒）指数退避；中断、`max_iterations` 耗尽、工具不可用和未知错误属于硬失败，不会自动重试。
+- **结构化结果：** 每个任务会返回 `attempts`、`attempt_history`、`failure_class`；恢复耗尽时额外返回 `recovery_status: "final_failed"` 和包含 `reason_code`、`message`、`next_action` 的 `fallback`。
 - **非持久化。** 如果父 agent 被中断，子 agent 会被取消。对于必须在当前轮次之后继续的工作，使用 `cronjob` 或 `terminal(background=True, notify_on_complete=True)`。
 
 配置：`config.yaml` 中的 `delegation.*`。
