@@ -34,6 +34,7 @@ so plugin-defined tools appear alongside the built-in tools.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import importlib.metadata
 import importlib.util
 import inspect
@@ -42,6 +43,7 @@ import os
 import sys
 import threading
 import types
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Union
@@ -77,6 +79,57 @@ class PluginToolOverrideError(PermissionError):
 
 
 logger = logging.getLogger(__name__)
+
+
+# Per-agent callbacks live in a ContextVar so concurrent gateway turns do not
+# share or overwrite one another's hook configuration.  Worker threads that
+# use the existing context propagation helpers inherit this value naturally.
+_active_hook_overrides: contextvars.ContextVar[Optional[Dict[str, List[Callable]]]] = (
+    contextvars.ContextVar("hermes_active_hook_overrides", default=None)
+)
+
+
+def _copy_hook_overrides(
+    overrides: Optional[Dict[str, List[Callable]]],
+) -> Optional[Dict[str, List[Callable]]]:
+    if not isinstance(overrides, dict):
+        return None
+    return {
+        str(name): list(callbacks)
+        for name, callbacks in overrides.items()
+        if isinstance(callbacks, (list, tuple)) and callbacks
+    } or None
+
+
+@contextmanager
+def scoped_hook_overrides(
+    overrides: Optional[Dict[str, List[Callable]]],
+):
+    """Temporarily append isolated instance callbacks to global hooks."""
+    token = _active_hook_overrides.set(_copy_hook_overrides(overrides))
+    try:
+        yield
+    finally:
+        _active_hook_overrides.reset(token)
+
+
+def _invoke_instance_hook(hook_name: str, **kwargs: Any) -> List[Any]:
+    overrides = _active_hook_overrides.get()
+    callbacks = (overrides or {}).get(hook_name, [])
+    results: List[Any] = []
+    for callback in callbacks:
+        try:
+            result = callback(**kwargs)
+            if result is not None:
+                results.append(result)
+        except Exception as exc:
+            logger.warning(
+                "Instance hook '%s' callback %s raised: %s",
+                hook_name,
+                getattr(callback, "__name__", repr(callback)),
+                exc,
+            )
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -2051,7 +2104,8 @@ def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
 
     Returns a list of non-``None`` return values from plugin callbacks.
     """
-    return get_plugin_manager().invoke_hook(hook_name, **kwargs)
+    results = get_plugin_manager().invoke_hook(hook_name, **kwargs)
+    return results + _invoke_instance_hook(hook_name, **kwargs)
 
 
 def invoke_middleware(kind: str, **kwargs: Any) -> List[Any]:
@@ -2073,7 +2127,9 @@ def has_middleware(kind: str) -> bool:
 
 def has_hook(hook_name: str) -> bool:
     """Return True when a hook has registered callbacks."""
-    return get_plugin_manager().has_hook(hook_name)
+    if get_plugin_manager().has_hook(hook_name):
+        return True
+    return bool((_active_hook_overrides.get() or {}).get(hook_name))
 
 
 _thread_tool_whitelist = threading.local()

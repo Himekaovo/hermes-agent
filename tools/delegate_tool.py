@@ -22,6 +22,17 @@ import json
 import logging
 
 logger = logging.getLogger(__name__)
+
+
+def _clone_hook_overrides(overrides: "Optional[Dict[str, List[Any]]]") -> dict:
+    """Copy an Agent's instance hooks so children cannot mutate the parent."""
+    if not isinstance(overrides, dict):
+        return {}
+    return {
+        str(name): list(callbacks)
+        for name, callbacks in overrides.items()
+        if isinstance(callbacks, (list, tuple)) and callbacks
+    }
 import os
 import threading
 import time
@@ -1464,6 +1475,9 @@ def _build_child_agent(
         thinking_callback=child_thinking_cb,
         session_db=getattr(parent_agent, "_session_db", None),
         parent_session_id=getattr(parent_agent, "session_id", None),
+        hook_overrides=_clone_hook_overrides(
+            getattr(parent_agent, "hook_overrides", None)
+        ),
         providers_allowed=child_providers_allowed,
         providers_ignored=child_providers_ignored,
         providers_order=child_providers_order,
