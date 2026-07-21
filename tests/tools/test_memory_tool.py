@@ -356,6 +356,15 @@ class TestMemoryStoreReplace:
         assert result["success"] is False
         assert result["gate"] == "protected_region"
 
+    def test_replace_allows_small_revision_of_same_entry(self, store):
+        store.add("memory", "The user prefers detailed technical explanations with concrete examples.")
+        result = store.replace(
+            "memory",
+            "detailed technical",
+            "The user prefers detailed technical explanations with concise concrete examples.",
+        )
+        assert result["success"] is True
+
     def test_replace_no_match(self, store):
         store.add("memory", "fact A")
         result = store.replace("memory", "nonexistent", "new")
@@ -729,6 +738,18 @@ class TestMemoryBatch:
         assert result["gate"] == "protected_region"
         assert "critical rule" in path.read_text(encoding="utf-8")
         assert "ordinary fact" in path.read_text(encoding="utf-8")
+
+    def test_batch_remove_before_protected_entry_is_allowed(self, store):
+        path = store._path_for("memory")
+        path.write_text(
+            "ordinary one\n§\nordinary two\n§\nprotected rule\n<!-- SLOW_UPDATE -->",
+            encoding="utf-8",
+        )
+        result = store.apply_batch("memory", [{"action": "remove", "old_text": "ordinary one"}])
+        assert result["success"] is True
+        remaining = path.read_text(encoding="utf-8")
+        assert "ordinary two" in remaining
+        assert "protected rule" in remaining
 
     def test_blocked_batch_creates_no_snapshot(self, store, tmp_path):
         path = store._path_for("memory")

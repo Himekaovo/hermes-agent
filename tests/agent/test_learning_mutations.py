@@ -93,6 +93,29 @@ def test_journey_edit_is_blocked_by_step_buffer(home):
     assert "step_buffer" in result["message"]
 
 
+def test_journey_edit_allows_small_revision(home):
+    path = home / "memories" / "USER.md"
+    path.write_text("The user prefers detailed technical explanations with concrete examples.", encoding="utf-8")
+    result = lm.edit_node(
+        "memory:profile:2",
+        "The user prefers detailed technical explanations with concise concrete examples.",
+    )
+    assert result["ok"]
+
+
+def test_journey_delete_before_protected_entry_is_allowed(home):
+    path = home / "memories" / "MEMORY.md"
+    path.write_text(
+        "ordinary one\n§\nordinary two\n§\nprotected rule\n<!-- SLOW_UPDATE -->",
+        encoding="utf-8",
+    )
+    result = lm.delete_node("memory:memory:0")
+    assert result["ok"]
+    remaining = path.read_text(encoding="utf-8")
+    assert "ordinary two" in remaining
+    assert "protected rule" in remaining
+
+
 def test_edit_memory_replaces_chunk(home):
     assert lm.edit_node("memory:profile:2", "rewritten profile")["ok"]
     assert (home / "memories" / "USER.md").read_text(encoding="utf-8").strip() == "rewritten profile"

@@ -9,6 +9,7 @@ import re
 import tempfile
 from contextlib import contextmanager
 from datetime import datetime, timezone
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
 
@@ -67,13 +68,25 @@ def _jsonl_lock(path: Path):
     lock_path = path.with_suffix(path.suffix + ".lock")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     handle = lock_path.open("a+", encoding="utf-8")
+    windows_lock = None
     try:
         try:
             import fcntl
 
             fcntl.flock(handle, fcntl.LOCK_EX)
         except (ImportError, OSError):
-            pass
+            try:
+                import msvcrt
+
+                windows_lock = msvcrt
+                handle.seek(0)
+                if handle.tell() == 0:
+                    handle.write("0")
+                    handle.flush()
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+            except (ImportError, OSError):
+                windows_lock = None
         yield
     finally:
         try:
@@ -81,7 +94,12 @@ def _jsonl_lock(path: Path):
 
             fcntl.flock(handle, fcntl.LOCK_UN)
         except (ImportError, OSError):
-            pass
+            if windows_lock is not None:
+                try:
+                    handle.seek(0)
+                    windows_lock.locking(handle.fileno(), windows_lock.LK_UNLCK, 1)
+                except OSError:
+                    pass
         handle.close()
 
 
@@ -334,9 +352,15 @@ def preflight(
         "recommendations": _recommendations(governance_dir, " ".join(proposed_entries)),
     }
     protected = protected_entries(current_entries)
-    changed = {index for index, (old, new) in enumerate(zip(current_entries, proposed_entries)) if old != new}
-    changed.update(range(len(proposed_entries), len(current_entries)))
-    impacted = [item for item in protected if item["entry_index"] in changed]
+    matching_old_indexes: set[int] = set()
+    for old_start, new_start, size in SequenceMatcher(
+        a=current_entries, b=proposed_entries, autojunk=False
+    ).get_matching_blocks():
+        matching_old_indexes.update(range(old_start, old_start + size))
+    impacted = [
+        item for item in protected
+        if item["entry_index"] not in matching_old_indexes
+    ]
     if impacted and operation in {"replace", "remove", "batch", "journey_edit", "journey_delete"}:
         return {**base, "allowed": False, "gate": "protected_region", "protected": impacted}
 
@@ -374,6 +398,8 @@ def preflight(
             ]
     for index, proposed in candidates:
         for old_index, existing in enumerate(current_entries):
+            if operation in {"replace", "journey_edit"} and old_index == index:
+                continue
             similarity = _similarity(existing, proposed)
             if len(_tokens(existing)) >= 2 and len(_tokens(proposed)) >= 2 and similarity >= 0.82:
                 conflicts.append({"entry_index": old_index, "similarity": round(similarity, 2), "preview": existing[:120]})

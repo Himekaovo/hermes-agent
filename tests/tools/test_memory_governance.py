@@ -109,6 +109,63 @@ def test_preflight_blocks_duplicate_and_conflicting_additions(tmp_path: Path):
     assert conflict["gate"] == "conflict_detected"
 
 
+def test_replace_does_not_conflict_with_its_previous_version(tmp_path: Path):
+    current = ["The user prefers detailed technical explanations with concrete examples."]
+    proposed = ["The user prefers detailed technical explanations with concise concrete examples."]
+    result = mg.preflight(
+        target="memory",
+        current_entries=current,
+        proposed_entries=proposed,
+        operation="replace",
+        governance_dir=tmp_path / "governance",
+    )
+    assert result["allowed"]
+
+
+def test_replace_still_conflicts_with_another_entry(tmp_path: Path):
+    current = [
+        "The user prefers detailed technical explanations with concrete examples.",
+        "The user prefers detailed technical explanations with concise concrete examples for documents.",
+    ]
+    proposed = [
+        "The user prefers detailed technical explanations with concise concrete examples.",
+        current[1],
+    ]
+    result = mg.preflight(
+        target="memory",
+        current_entries=current,
+        proposed_entries=proposed,
+        operation="replace",
+        governance_dir=tmp_path / "governance",
+    )
+    assert not result["allowed"]
+    assert result["gate"] == "conflict_detected"
+
+
+def test_remove_before_protected_entry_is_allowed(tmp_path: Path):
+    current = ["ordinary one", "ordinary two", "protected rule\n<!-- SLOW_UPDATE -->"]
+    result = mg.preflight(
+        target="memory",
+        current_entries=current,
+        proposed_entries=current[1:],
+        operation="remove",
+        governance_dir=tmp_path / "governance",
+    )
+    assert result["allowed"]
+
+
+def test_batch_remove_before_protected_span_is_allowed(tmp_path: Path):
+    current = ["ordinary one", "ordinary two", "protected rule\n<!-- SLOW_UPDATE -->"]
+    result = mg.preflight(
+        target="memory",
+        current_entries=current,
+        proposed_entries=current[1:],
+        operation="batch",
+        governance_dir=tmp_path / "governance",
+    )
+    assert result["allowed"]
+
+
 def test_preflight_blocks_protected_mutation_and_bad_content(tmp_path: Path):
     current = ["critical rule\n<!-- SLOW_UPDATE -->"]
     protected = mg.preflight(
