@@ -577,6 +577,7 @@ class GitHubSource(SkillSource):
         self._tree_cache: Dict[str, Tuple[str, List[dict]]] = {}
         self._tree_revisions: Dict[str, str] = {}
         self._commit_revisions: Dict[str, str] = {}
+        self._default_branches: Dict[str, str] = {}
         # Per-repo cache of the optional skills.sh.json grouping sidecar,
         # mapping skill_name -> human-readable grouping title. ``None`` means
         # "fetched, no sidecar"; a missing key means "not fetched yet".
@@ -643,7 +644,14 @@ class GitHubSource(SkillSource):
         repo = f"{parts[0]}/{parts[1]}"
         skill_path = parts[2]
 
-        skill_md = self._fetch_file_content(repo, f"{skill_path.rstrip('/')}/SKILL.md")
+        branch = self._get_default_branch(repo)
+        if not branch:
+            branch = None
+        commit_sha = self._resolve_commit_sha(repo, branch) if branch else None
+        pinned_ref = commit_sha or branch
+        skill_md = self._fetch_file_content(
+            repo, f"{skill_path.rstrip('/')}/SKILL.md", ref=pinned_ref
+        )
         if skill_md is None:
             return None
         referenced = _referenced_support_paths(skill_md)
@@ -651,10 +659,9 @@ class GitHubSource(SkillSource):
             return None
 
         files: Dict[str, Union[str, bytes]] = {"SKILL.md": skill_md}
-        tree = self._get_repo_tree(repo)
+        tree = self._get_repo_tree(repo, ref=pinned_ref)
         if tree is not None:
-            branch, entries = tree
-            self._resolve_commit_sha(repo, branch)
+            tree_ref, entries = tree
             prefix = f"{skill_path.rstrip('/')}/"
             entries_by_path = {item.get("path", ""): item for item in entries}
             for rel_path in sorted(referenced):
@@ -666,18 +673,20 @@ class GitHubSource(SkillSource):
                 if item.get("type") != "blob" or item.get("mode") == "120000":
                     logger.warning("Rejected non-regular file in skill bundle: %s", item_path)
                     return None
-                content = self._fetch_file_bytes(repo, item_path)
+                content = self._fetch_file_bytes(repo, item_path, ref=pinned_ref)
                 if content is None:
                     return None
                 files[rel_path] = content
-            revision = self._tree_revisions.get(repo) or branch
+            revision = commit_sha or tree_ref
         else:
             for rel_path in referenced:
-                content = self._fetch_file_bytes(repo, f"{skill_path.rstrip('/')}/{rel_path}")
+                content = self._fetch_file_bytes(
+                    repo, f"{skill_path.rstrip('/')}/{rel_path}", ref=pinned_ref
+                )
                 if content is None:
                     return None
                 files[rel_path] = content
-            revision = ""
+            revision = commit_sha or pinned_ref or ""
 
         skill_name = skill_path.rstrip("/").split("/")[-1]
         trust = self.trust_level_for(identifier)
@@ -695,7 +704,7 @@ class GitHubSource(SkillSource):
                 ),
                 "source_revision": revision,
                 "ref": branch,
-                "commit_sha": self._commit_revisions.get(repo),
+                "commit_sha": commit_sha,
             },
         )
 
@@ -788,7 +797,26 @@ class GitHubSource(SkillSource):
 
     # -- Repo tree cache (avoids redundant API calls) --
 
-    def _get_repo_tree(self, repo: str) -> Optional[Tuple[str, List[dict]]]:
+    def _get_default_branch(self, repo: str) -> Optional[str]:
+        if repo in self._default_branches:
+            return self._default_branches[repo]
+        try:
+            resp = httpx.get(
+                f"https://api.github.com/repos/{repo}",
+                headers=self.auth.get_headers(), timeout=15, follow_redirects=True,
+            )
+            if resp.status_code != 200:
+                self._check_rate_limit_response(resp)
+                return None
+            branch = resp.json().get("default_branch", "main")
+            if isinstance(branch, str) and branch:
+                self._default_branches[repo] = branch
+                return branch
+        except (httpx.HTTPError, ValueError):
+            return None
+        return None
+
+    def _get_repo_tree(self, repo: str, *, ref: Optional[str] = None) -> Optional[Tuple[str, List[dict]]]:
         """Get cached or fresh repo tree.
 
         Returns ``(default_branch, tree_entries)`` or ``None``.
@@ -799,28 +827,19 @@ class GitHubSource(SkillSource):
         6 duplicated pairs per install, consuming ~12 of the 60/hr
         unauthenticated rate limit for nothing).
         """
-        if repo in self._tree_cache:
+        if ref is None and repo in self._tree_cache:
             return self._tree_cache[repo]
 
         headers = self.auth.get_headers()
 
-        # Resolve default branch
-        try:
-            resp = httpx.get(
-                f"https://api.github.com/repos/{repo}",
-                headers=headers, timeout=15, follow_redirects=True,
-            )
-            if resp.status_code != 200:
-                self._check_rate_limit_response(resp)
-                return None
-            default_branch = resp.json().get("default_branch", "main")
-        except (httpx.HTTPError, ValueError):
+        tree_ref = ref or self._get_default_branch(repo)
+        if not tree_ref:
             return None
 
         # Fetch recursive tree
         try:
             resp = httpx.get(
-                f"https://api.github.com/repos/{repo}/git/trees/{default_branch}",
+                f"https://api.github.com/repos/{repo}/git/trees/{tree_ref}",
                 params={"recursive": "1"},
                 headers=headers, timeout=30, follow_redirects=True,
             )
@@ -838,8 +857,10 @@ class GitHubSource(SkillSource):
         revision = tree_data.get("sha")
         if isinstance(revision, str) and revision:
             self._tree_revisions[repo] = revision
-        self._tree_cache[repo] = (default_branch, entries)
-        return (default_branch, entries)
+        result = (tree_ref, entries)
+        if ref is None:
+            self._tree_cache[repo] = result
+        return result
 
     def _resolve_commit_sha(self, repo: str, ref: str) -> Optional[str]:
         """Resolve the immutable commit behind a branch/ref when provenance needs it."""
@@ -1071,9 +1092,9 @@ class GitHubSource(SkillSource):
 
         return None
 
-    def _fetch_file_content(self, repo: str, path: str) -> Optional[str]:
+    def _fetch_file_content(self, repo: str, path: str, *, ref: Optional[str] = None) -> Optional[str]:
         """Fetch a single text file from GitHub."""
-        content = self._fetch_file_bytes(repo, path)
+        content = self._fetch_file_bytes(repo, path, ref=ref)
         if content is None:
             return None
         try:
@@ -1081,11 +1102,12 @@ class GitHubSource(SkillSource):
         except UnicodeDecodeError:
             return None
 
-    def _fetch_file_bytes(self, repo: str, path: str) -> Optional[bytes]:
+    def _fetch_file_bytes(self, repo: str, path: str, *, ref: Optional[str] = None) -> Optional[bytes]:
         """Fetch exact file bytes from GitHub without text decoding."""
         url = f"https://api.github.com/repos/{repo}/contents/{path}"
         resp = self._github_get(
             url,
+            params={"ref": ref} if ref else None,
             headers={**self.auth.get_headers(), "Accept": "application/vnd.github.v3.raw"},
         )
         if resp is not None and resp.status_code == 200:

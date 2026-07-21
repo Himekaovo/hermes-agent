@@ -2467,6 +2467,63 @@ class TestSkillWikiInstallIntegration:
         assert row.value["local_modified_count"] == 1
 
 
+class TestGitHubProvenanceRevision:
+    def test_fallback_fetch_uses_nullable_branch_without_tree(self, monkeypatch):
+        src = GitHubSource(auth=MagicMock())
+        monkeypatch.setattr(src, "_get_default_branch", lambda _repo: "main")
+        monkeypatch.setattr(src, "_resolve_commit_sha", lambda _repo, _ref: "commit-a")
+        monkeypatch.setattr(src, "_get_repo_tree", lambda _repo, ref=None: None)
+        monkeypatch.setattr(
+            src,
+            "_fetch_file_content",
+            lambda _repo, _path, ref=None: "# demo\n\nSee [ref](references/a.md)" if _path.endswith("SKILL.md") else None,
+        )
+        calls = []
+        monkeypatch.setattr(
+            src,
+            "_fetch_file_bytes",
+            lambda _repo, path, ref=None: calls.append((path, ref)) or b"reference",
+        )
+
+        bundle = src.fetch("acme/demo/demo")
+
+        assert bundle is not None
+        assert bundle.metadata["ref"] == "main"
+        assert bundle.metadata["commit_sha"] == "commit-a"
+        assert calls == [("demo/references/a.md", "commit-a")]
+
+    def test_tree_fetch_pins_skill_and_support_files_to_commit(self, monkeypatch):
+        src = GitHubSource(auth=MagicMock())
+        monkeypatch.setattr(src, "_get_default_branch", lambda _repo: "main")
+        monkeypatch.setattr(src, "_resolve_commit_sha", lambda _repo, _ref: "commit-a")
+        monkeypatch.setattr(
+            src,
+            "_get_repo_tree",
+            lambda _repo, ref=None: (ref, [{"path": "demo/references/a.md", "type": "blob"}]),
+        )
+        calls = []
+
+        def fetch_text(_repo, path, ref=None):
+            calls.append((path, ref))
+            return "# demo\n\nSee [ref](references/a.md)"
+
+        monkeypatch.setattr(src, "_fetch_file_content", fetch_text)
+        monkeypatch.setattr(
+            src,
+            "_fetch_file_bytes",
+            lambda _repo, path, ref=None: calls.append((path, ref)) or b"reference",
+        )
+
+        bundle = src.fetch("acme/demo/demo")
+
+        assert bundle is not None
+        assert bundle.metadata["commit_sha"] == "commit-a"
+        assert calls == [
+            ("demo/SKILL.md", "commit-a"),
+            ("demo/references/a.md", "commit-a"),
+        ]
+
+
 # ---------------------------------------------------------------------------
 # parallel_search_sources — overall_timeout must be honoured even when a
 # source blocks for far longer than the budget (regression: the executor used
