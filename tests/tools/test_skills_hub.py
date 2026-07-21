@@ -8,6 +8,8 @@ from unittest.mock import patch, MagicMock
 import httpx
 import pytest
 
+import tools.skills_hub as hub
+from tools.skills_guard import ScanResult
 from tools.skills_hub import (
     GitHubAuth,
     GitHubSource,
@@ -2394,6 +2396,59 @@ class TestInstallPathSafety:
 
         assert not (skills_dir / "bad-skill" / "leak.txt").exists()
         assert secret.read_text() == "data exfiltration payload\n"
+
+
+# ---------------------------------------------------------------------------
+# SkillWiki provenance after install
+# ---------------------------------------------------------------------------
+
+
+class TestSkillWikiInstallIntegration:
+    @staticmethod
+    def _quarantined_bundle(tmp_path, monkeypatch):
+        hub_dir = tmp_path / "skills" / ".hub"
+        quarantine = hub_dir / "quarantine" / "demo"
+        quarantine.mkdir(parents=True)
+        (quarantine / "SKILL.md").write_text("# demo", encoding="utf-8")
+        monkeypatch.setattr(hub, "HUB_DIR", hub_dir)
+        monkeypatch.setattr(hub, "SKILLS_DIR", tmp_path / "skills")
+        bundle = SkillBundle(
+            "demo", {"SKILL.md": "# demo"}, "github", "acme/demo", "community"
+        )
+        scan = ScanResult(
+            skill_name="demo",
+            source="github",
+            trust_level="community",
+            verdict="allow",
+            findings=[],
+        )
+        return hub_dir, quarantine, bundle, scan
+
+    def test_successful_install_records_skillwiki_provenance(self, monkeypatch, tmp_path):
+        from tools.skillwiki import SkillWiki
+
+        hub_dir, quarantine, bundle, scan = self._quarantined_bundle(tmp_path, monkeypatch)
+
+        install_dir = hub.install_from_quarantine(quarantine, "demo", "", bundle, scan)
+
+        row = SkillWiki(hub_dir / "provenance.db").get_skill("github:acme/demo:")
+        assert row.available is True
+        assert row.value["local_path"] == str(install_dir)
+        assert row.value["status"] == "raw"
+        lock = json.loads((hub_dir / "lock.json").read_text(encoding="utf-8"))
+        assert lock["installed"]["demo"]["install_path"] == "demo"
+
+    def test_skillwiki_failure_does_not_fail_successful_install(self, monkeypatch, tmp_path):
+        hub_dir, quarantine, bundle, scan = self._quarantined_bundle(tmp_path, monkeypatch)
+        with patch(
+            "tools.skillwiki.SkillWiki.record_import", side_effect=OSError("db down")
+        ) as record_import:
+            install_dir = hub.install_from_quarantine(quarantine, "demo", "", bundle, scan)
+
+        assert install_dir.exists()
+        record_import.assert_called_once()
+        lock = json.loads((hub_dir / "lock.json").read_text(encoding="utf-8"))
+        assert lock["installed"]["demo"]["install_path"] == "demo"
 
 
 # ---------------------------------------------------------------------------

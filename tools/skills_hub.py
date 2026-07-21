@@ -3649,6 +3649,17 @@ def install_from_quarantine(
         scan_provenance=scan_provenance or getattr(scan_result, "scan_provenance", None),
     )
 
+    try:
+        from tools.skillwiki import SkillWiki
+        SkillWiki(_hub_dir() / "provenance.db").record_import(
+            bundle,
+            install_dir,
+            ref=bundle.metadata.get("ref"),
+            commit_sha=bundle.metadata.get("commit_sha"),
+        )
+    except Exception as exc:
+        logger.warning("SkillWiki provenance unavailable; keeping Hub install: %s", exc)
+
     append_audit_log(
         "INSTALL", safe_skill_name, bundle.source,
         bundle.trust_level, scan_result.verdict,
