@@ -46,6 +46,114 @@ def _display_source(r) -> str:
 # Shared do_* functions
 # ---------------------------------------------------------------------------
 
+def _skillwiki(db_path: Optional[Path] = None):
+    from tools.skills_hub import _hub_dir
+    from tools.skillwiki import SkillWiki
+
+    return SkillWiki(db_path or (_hub_dir() / "provenance.db"))
+
+
+def do_wiki_import(identifier: str, category: str = "", force: bool = False,
+                   skip_confirm: bool = False, console: Optional[Console] = None) -> None:
+    """Delegate import to the existing Skill Hub installation path."""
+    kwargs = {"category": category, "force": force, "skip_confirm": skip_confirm}
+    if console is not None:
+        kwargs["console"] = console
+    do_install(identifier, **kwargs)
+
+
+def do_wiki_list(status: Optional[str] = None, source: Optional[str] = None,
+                 db_path: Optional[Path] = None, console: Optional[Console] = None,
+                 as_json: bool = False) -> int:
+    c = console or _console
+    result = _skillwiki(db_path).list_skills()
+    if not result.available:
+        payload = {"available": False, "reason": result.reason, "items": []}
+        if as_json:
+            c.print(json.dumps(payload, sort_keys=True))
+        else:
+            c.print(f"[yellow]SkillWiki unavailable:[/] {result.reason}")
+        return 1
+    items = [item for item in result.items
+             if (status is None or item.get("status") == status)
+             and (source is None or item.get("source") == source)]
+    if as_json:
+        c.print(json.dumps({"available": True, "items": items}, sort_keys=True))
+        return 0
+    table = Table(title="SkillWiki Provenance")
+    table.add_column("Skill ID")
+    table.add_column("Status")
+    table.add_column("Source")
+    table.add_column("Imported")
+    for item in items:
+        table.add_row(item["skill_id"], item["status"], item["source"], item["imported_at"])
+    c.print(table)
+    return 0
+
+
+def do_wiki_show(skill_id: str, db_path: Optional[Path] = None,
+                 console: Optional[Console] = None, as_json: bool = False) -> int:
+    c = console or _console
+    result = _skillwiki(db_path).get_skill(skill_id)
+    if not result.available or result.value is None:
+        payload = {"available": result.available, "reason": result.reason,
+                   "value": result.value}
+        if as_json:
+            c.print(json.dumps(payload, sort_keys=True))
+        else:
+            c.print(f"[yellow]SkillWiki record unavailable:[/] {result.reason or 'skill_not_found'}")
+        return 1
+    if as_json:
+        c.print(json.dumps(result.value, sort_keys=True))
+    else:
+        c.print(json.dumps(result.value, indent=2, sort_keys=True))
+    return 0
+
+
+def do_wiki_relation(action: str, from_skill_id: Optional[str] = None,
+                     to_skill_id: Optional[str] = None, relation: Optional[str] = None,
+                     skill_id: Optional[str] = None, db_path: Optional[Path] = None,
+                     console: Optional[Console] = None, as_json: bool = False) -> int:
+    c = console or _console
+    wiki = _skillwiki(db_path)
+    if action == "add":
+        result = wiki.add_relation(from_skill_id, to_skill_id, relation)
+    elif action == "remove":
+        result = wiki.remove_relation(from_skill_id, to_skill_id, relation)
+    else:
+        result = wiki.list_relations(skill_id)
+    payload = {"available": result.available, "reason": result.reason,
+               "items": result.items, "value": result.value}
+    if as_json:
+        c.print(json.dumps(payload, sort_keys=True))
+    elif result.available:
+        c.print(json.dumps(payload["value"] if action != "list" else payload["items"], indent=2, sort_keys=True))
+    else:
+        c.print(f"[yellow]SkillWiki relation unavailable:[/] {result.reason}")
+    return 0 if result.available else 1
+
+
+def do_wiki_status(skill_id: str, new_status: str, reason: str = "",
+                   db_path: Optional[Path] = None, console: Optional[Console] = None) -> int:
+    c = console or _console
+    result = _skillwiki(db_path).transition(skill_id, new_status, actor="cli", reason=reason)
+    if not result.available:
+        c.print(f"[yellow]SkillWiki status change rejected:[/] {result.reason}")
+        return 1
+    c.print(f"[green]Status:[/] {result.value['status']}")
+    return 0
+
+
+def do_wiki_check(skill_id: Optional[str] = None, db_path: Optional[Path] = None,
+                  console: Optional[Console] = None, as_json: bool = False) -> int:
+    c = console or _console
+    report = _skillwiki(db_path).check(skill_id)
+    if as_json:
+        c.print(json.dumps(report, sort_keys=True))
+    else:
+        c.print(json.dumps(report, indent=2, sort_keys=True))
+    return 0 if report.get("available") is False or report.get("available") is True else 1
+
 def _resolve_short_name(name: str, sources, console: Console) -> str:
     """
     Resolve a short skill name (e.g. 'pptx') to a full identifier by searching
@@ -1703,6 +1811,30 @@ def do_snapshot_import(input_path: str, force: bool = False,
 def skills_command(args) -> None:
     """Router for `hermes skills <subcommand>` — called from hermes_cli/main.py."""
     action = getattr(args, "skills_action", None)
+
+    if action == "wiki":
+        wiki_action = getattr(args, "wiki_action", None)
+        if wiki_action == "import":
+            do_wiki_import(args.identifier, category=getattr(args, "category", ""),
+                           force=getattr(args, "force", False),
+                           skip_confirm=getattr(args, "yes", False))
+        elif wiki_action == "list":
+            do_wiki_list(status=getattr(args, "status", None), source=getattr(args, "source", None),
+                         as_json=getattr(args, "json", False))
+        elif wiki_action == "show":
+            do_wiki_show(args.skill_id, as_json=getattr(args, "json", False))
+        elif wiki_action == "relation":
+            relation_action = getattr(args, "relation_action", None)
+            do_wiki_relation(relation_action, from_skill_id=getattr(args, "from_skill_id", None),
+                             to_skill_id=getattr(args, "to_skill_id", None), relation=getattr(args, "type", None),
+                             skill_id=getattr(args, "skill_id", None), as_json=getattr(args, "json", False))
+        elif wiki_action == "status":
+            do_wiki_status(args.skill_id, args.new_status, reason=getattr(args, "reason", ""))
+        elif wiki_action == "check":
+            do_wiki_check(getattr(args, "skill_id", None), as_json=getattr(args, "json", False))
+        else:
+            _console.print("Usage: hermes skills wiki [import|list|show|relation|status|check]\n")
+        return
 
     if action == "browse":
         do_browse(page=args.page, page_size=args.size, source=args.source)

@@ -307,6 +307,49 @@ def build_skills_parser(subparsers, *, cmd_skills: Callable) -> None:
     tap_rm = tap_subparsers.add_parser("remove", help="Remove a tap")
     tap_rm.add_argument("name", help="Tap name to remove")
 
+    skills_wiki = skills_subparsers.add_parser(
+        "wiki", help="Inspect and govern SkillWiki provenance metadata"
+    )
+    wiki_subparsers = skills_wiki.add_subparsers(dest="wiki_action")
+
+    wiki_import = wiki_subparsers.add_parser("import", help="Install through the existing Hub and record provenance")
+    wiki_import.add_argument("identifier")
+    wiki_import.add_argument("--category", default="")
+    wiki_import.add_argument("--force", action="store_true")
+    wiki_import.add_argument("--yes", "-y", action="store_true")
+
+    wiki_list = wiki_subparsers.add_parser("list", help="List provenance records")
+    wiki_list.add_argument("--status", choices=["raw", "candidate", "draft", "verified", "release", "degraded", "deprecated", "archived"])
+    wiki_list.add_argument("--source")
+    wiki_list.add_argument("--json", action="store_true")
+
+    wiki_show = wiki_subparsers.add_parser("show", help="Show one provenance record")
+    wiki_show.add_argument("skill_id")
+    wiki_show.add_argument("--json", action="store_true")
+
+    wiki_relation = wiki_subparsers.add_parser("relation", help="Manage provenance relations")
+    relation_subparsers = wiki_relation.add_subparsers(dest="relation_action")
+    relation_add = relation_subparsers.add_parser("add")
+    relation_add.add_argument("from_skill_id")
+    relation_add.add_argument("to_skill_id")
+    relation_add.add_argument("--type", choices=["inspired_by", "depends_on", "references"], required=True)
+    relation_remove = relation_subparsers.add_parser("remove")
+    relation_remove.add_argument("from_skill_id")
+    relation_remove.add_argument("to_skill_id")
+    relation_remove.add_argument("--type", choices=["inspired_by", "depends_on", "references"], required=True)
+    relation_list = relation_subparsers.add_parser("list")
+    relation_list.add_argument("skill_id", nargs="?")
+    relation_list.add_argument("--json", action="store_true")
+
+    wiki_status = wiki_subparsers.add_parser("status", help="Perform an explicit lifecycle transition")
+    wiki_status.add_argument("skill_id")
+    wiki_status.add_argument("new_status", choices=["raw", "candidate", "draft", "verified", "release", "degraded", "deprecated", "archived"])
+    wiki_status.add_argument("--reason", default="")
+
+    wiki_check = wiki_subparsers.add_parser("check", help="Check provenance without changing skill files")
+    wiki_check.add_argument("skill_id", nargs="?")
+    wiki_check.add_argument("--json", action="store_true")
+
     # config sub-action: interactive enable/disable
     skills_subparsers.add_parser(
         "config",
