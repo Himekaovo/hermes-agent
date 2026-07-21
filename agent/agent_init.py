@@ -346,6 +346,7 @@ def init_agent(
     checkpoint_max_total_size_mb: int = 500,
     checkpoint_max_file_size_mb: int = 10,
     pass_session_id: bool = False,
+    hook_overrides: Optional[Dict[str, List[Callable]]] = None,
 ):
     """
     Initialize the AI Agent.
@@ -556,6 +557,11 @@ def init_agent(
         ).start()
 
     agent.tool_progress_callback = tool_progress_callback
+    agent.hook_overrides = {
+        str(name): list(callbacks)
+        for name, callbacks in (hook_overrides or {}).items()
+        if isinstance(callbacks, (list, tuple)) and callbacks
+    }
     agent.tool_start_callback = tool_start_callback
     agent.tool_complete_callback = tool_complete_callback
     agent.suppress_status_output = False

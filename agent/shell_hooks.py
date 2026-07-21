@@ -284,6 +284,44 @@ def register_from_config(
     return registered
 
 
+def build_instance_hooks(
+    cfg: Optional[Dict[str, Any]],
+    *,
+    accept_hooks: bool = False,
+) -> Dict[str, List[Callable[..., Any]]]:
+    """Build shell-hook callbacks without registering them globally.
+
+    The returned mapping is suitable for ``AIAgent(hook_overrides=...)``.
+    It uses the same parser, consent, allowlist, and callback implementation as
+    :func:`register_from_config`, but never mutates the process-wide plugin
+    manager or the global registration idempotence set.
+    """
+    if not isinstance(cfg, dict):
+        return {}
+
+    from utils import env_var_enabled
+
+    if env_var_enabled("HERMES_SAFE_MODE"):
+        logger.info("HERMES_SAFE_MODE=1 - instance shell-hook build skipped")
+        return {}
+
+    effective_accept = _resolve_effective_accept(cfg, accept_hooks)
+    overrides: Dict[str, List[Callable[..., Any]]] = {}
+    for spec in _parse_hooks_block(cfg.get("hooks")):
+        if not _is_allowlisted(spec.event, spec.command):
+            if not _prompt_and_record(
+                spec.event, spec.command, accept_hooks=effective_accept,
+            ):
+                logger.warning(
+                    "instance shell hook for %s (%s) not allowlisted - skipped",
+                    spec.event,
+                    spec.command,
+                )
+                continue
+        overrides.setdefault(spec.event, []).append(_make_callback(spec))
+    return overrides
+
+
 def iter_configured_hooks(cfg: Optional[Dict[str, Any]]) -> List[ShellHookSpec]:
     """Return the parsed ``ShellHookSpec`` entries from config without
     registering anything.  Used by ``hermes hooks list`` and ``doctor``."""

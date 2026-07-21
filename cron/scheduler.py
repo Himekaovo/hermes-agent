@@ -44,8 +44,25 @@ from hermes_cli._subprocess_compat import windows_hide_flags
 from hermes_cli.config import load_config, _expand_env_vars
 from hermes_cli.fallback_config import get_fallback_chain
 from hermes_time import now as _hermes_now
+from agent.shell_hooks import build_instance_hooks
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_cron_hook_overrides(job: dict, cfg: dict) -> dict:
+    """Build callbacks declared by one Cron job without global registration."""
+    hooks = job.get("hooks") if isinstance(job, dict) else None
+    if not isinstance(hooks, dict) or not hooks:
+        return {}
+    instance_cfg = {
+        "hooks": hooks,
+        "hooks_auto_accept": bool((cfg or {}).get("hooks_auto_accept")),
+    }
+    try:
+        return build_instance_hooks(instance_cfg)
+    except Exception:
+        logger.warning("Failed to build Cron job hook overrides", exc_info=True)
+        return {}
 
 
 def _set_cron_session_title(session_db, session_id, base_title):
@@ -3368,6 +3385,7 @@ def run_job(
             platform="cron",
             session_id=_cron_session_id,
             session_db=_session_db,
+            hook_overrides=_resolve_cron_hook_overrides(job, _cfg),
         )
         
         # Run the agent with an *inactivity*-based timeout: the job can run

@@ -63,6 +63,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from hermes_constants import get_hermes_home
+from hermes_cli.plugins import scoped_hook_overrides
 
 
 def _launch_cwd_for_session(source: str) -> Optional[str]:
@@ -492,6 +493,7 @@ class AIAgent:
         checkpoint_max_total_size_mb: int = 500,
         checkpoint_max_file_size_mb: int = 10,
         pass_session_id: bool = False,
+        hook_overrides: Optional[Dict[str, List[Callable]]] = None,
     ):
         """Forwarder — see ``agent.agent_init.init_agent``."""
         from agent.agent_init import init_agent
@@ -568,6 +570,7 @@ class AIAgent:
             checkpoint_max_total_size_mb=checkpoint_max_total_size_mb,
             checkpoint_max_file_size_mb=checkpoint_max_file_size_mb,
             pass_session_id=pass_session_id,
+            hook_overrides=hook_overrides,
         )
 
     def _get_session_db_for_recall(self):
@@ -6367,21 +6370,22 @@ class AIAgent:
         # Keep the scope local instead of storing ContextVar tokens on the agent,
         # which may be observed from another thread.
         with scoped_runtime_main({}):
-            try:
-                return run_conversation(
-                    self,
-                    user_message,
-                    system_message,
-                    conversation_history,
-                    task_id,
-                    stream_callback,
-                    persist_user_message,
-                    persist_user_timestamp=persist_user_timestamp,
-                    moa_config=moa_config,
-                )
-            finally:
-                reset_accounting_context(acct_token)
-                reset_conversation_context(token)
+            with scoped_hook_overrides(getattr(self, "hook_overrides", None)):
+                try:
+                    return run_conversation(
+                        self,
+                        user_message,
+                        system_message,
+                        conversation_history,
+                        task_id,
+                        stream_callback,
+                        persist_user_message,
+                        persist_user_timestamp=persist_user_timestamp,
+                        moa_config=moa_config,
+                    )
+                finally:
+                    reset_accounting_context(acct_token)
+                    reset_conversation_context(token)
 
     def chat(self, message: str, stream_callback: Optional[callable] = None) -> str:
         """

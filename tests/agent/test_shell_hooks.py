@@ -31,6 +31,48 @@ def _allowlist_pair(monkeypatch, tmp_path, event: str, command: str) -> None:
     shell_hooks._record_approval(event, command)
 
 
+def test_build_instance_hooks_does_not_register_globally(monkeypatch, tmp_path):
+    command = "python hook.py"
+    cfg = {
+        "hooks": {
+            "on_session_start": [{"command": command}],
+        },
+    }
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_home"))
+    monkeypatch.setattr(shell_hooks, "_make_callback", lambda spec: "callback")
+
+    overrides = shell_hooks.build_instance_hooks(cfg, accept_hooks=True)
+
+    assert list(overrides) == ["on_session_start"]
+    assert overrides["on_session_start"] == ["callback"]
+    assert shell_hooks._registered == set()
+
+
+def test_build_instance_hooks_skips_malformed_and_keeps_valid_entries(monkeypatch, tmp_path):
+    cfg = {
+        "hooks": {
+            "on_session_start": [
+                {"command": "python first.py"},
+                {"timeout": 1},
+                {"command": "python second.py"},
+            ],
+        },
+    }
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_home"))
+    monkeypatch.setattr(
+        shell_hooks,
+        "_make_callback",
+        lambda spec: spec.command,
+    )
+
+    overrides = shell_hooks.build_instance_hooks(cfg, accept_hooks=True)
+
+    assert overrides["on_session_start"] == [
+        "python first.py",
+        "python second.py",
+    ]
+
+
 @pytest.fixture(autouse=True)
 def _reset_registration_state():
     shell_hooks.reset_for_tests()
