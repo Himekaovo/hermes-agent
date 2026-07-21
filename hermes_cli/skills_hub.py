@@ -1815,26 +1815,27 @@ def skills_command(args) -> None:
     if action == "wiki":
         wiki_action = getattr(args, "wiki_action", None)
         if wiki_action == "import":
-            do_wiki_import(args.identifier, category=getattr(args, "category", ""),
-                           force=getattr(args, "force", False),
-                           skip_confirm=getattr(args, "yes", False))
+            result = do_wiki_import(args.identifier, category=getattr(args, "category", ""),
+                                    force=getattr(args, "force", False),
+                                    skip_confirm=getattr(args, "yes", False))
         elif wiki_action == "list":
-            do_wiki_list(status=getattr(args, "status", None), source=getattr(args, "source", None),
-                         as_json=getattr(args, "json", False))
+            result = do_wiki_list(status=getattr(args, "status", None), source=getattr(args, "source", None),
+                                  as_json=getattr(args, "json", False))
         elif wiki_action == "show":
-            do_wiki_show(args.skill_id, as_json=getattr(args, "json", False))
+            result = do_wiki_show(args.skill_id, as_json=getattr(args, "json", False))
         elif wiki_action == "relation":
             relation_action = getattr(args, "relation_action", None)
-            do_wiki_relation(relation_action, from_skill_id=getattr(args, "from_skill_id", None),
-                             to_skill_id=getattr(args, "to_skill_id", None), relation=getattr(args, "type", None),
-                             skill_id=getattr(args, "skill_id", None), as_json=getattr(args, "json", False))
+            result = do_wiki_relation(relation_action, from_skill_id=getattr(args, "from_skill_id", None),
+                                      to_skill_id=getattr(args, "to_skill_id", None), relation=getattr(args, "type", None),
+                                      skill_id=getattr(args, "skill_id", None), as_json=getattr(args, "json", False))
         elif wiki_action == "status":
-            do_wiki_status(args.skill_id, args.new_status, reason=getattr(args, "reason", ""))
+            result = do_wiki_status(args.skill_id, args.new_status, reason=getattr(args, "reason", ""))
         elif wiki_action == "check":
-            do_wiki_check(getattr(args, "skill_id", None), as_json=getattr(args, "json", False))
+            result = do_wiki_check(getattr(args, "skill_id", None), as_json=getattr(args, "json", False))
         else:
             _console.print("Usage: hermes skills wiki [import|list|show|relation|status|check]\n")
-        return
+            return 0
+        return result if isinstance(result, int) else 0
 
     if action == "browse":
         do_browse(page=args.page, page_size=args.size, source=args.source)

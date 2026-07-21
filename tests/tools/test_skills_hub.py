@@ -2450,6 +2450,22 @@ class TestSkillWikiInstallIntegration:
         lock = json.loads((hub_dir / "lock.json").read_text(encoding="utf-8"))
         assert lock["installed"]["demo"]["install_path"] == "demo"
 
+    def test_reinstall_counts_preexisting_local_edit(self, monkeypatch, tmp_path):
+        from tools.skillwiki import SkillWiki
+
+        hub_dir, quarantine, bundle, scan = self._quarantined_bundle(tmp_path, monkeypatch)
+        hub.install_from_quarantine(quarantine, "demo", "", bundle, scan)
+        install_dir = tmp_path / "skills" / "demo"
+        (install_dir / "SKILL.md").write_text("# local edit", encoding="utf-8")
+
+        quarantine.mkdir(parents=True)
+        (quarantine / "SKILL.md").write_text("# upstream v2", encoding="utf-8")
+        updated = SkillBundle("demo", {"SKILL.md": "# upstream v2"}, "github", "acme/demo", "community")
+        hub.install_from_quarantine(quarantine, "demo", "", updated, scan)
+
+        row = SkillWiki(hub_dir / "provenance.db").get_skill("github:acme/demo:")
+        assert row.value["local_modified_count"] == 1
+
 
 # ---------------------------------------------------------------------------
 # parallel_search_sources — overall_timeout must be honoured even when a

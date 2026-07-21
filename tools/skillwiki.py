@@ -178,11 +178,30 @@ class SkillWiki:
             yield connection
             if initialize and not read_only:
                 connection.commit()
+        except Exception:
+            if initialize and not read_only:
+                connection.rollback()
+            raise
         finally:
             connection.close()
 
     @staticmethod
     def _initialize(connection: sqlite3.Connection) -> None:
+        legacy_tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE '%_legacy'"
+            ).fetchall()
+        }
+        if legacy_tables:
+            expected = {"skills_legacy", "relations_legacy", "lifecycle_events_legacy"}
+            if legacy_tables != expected:
+                raise sqlite3.DatabaseError("incomplete SkillWiki migration")
+            for table in ("lifecycle_events", "relations", "skills"):
+                connection.execute(f"DROP TABLE IF EXISTS {table}")
+            connection.execute("ALTER TABLE skills_legacy RENAME TO skills")
+            connection.execute("ALTER TABLE relations_legacy RENAME TO relations")
+            connection.execute("ALTER TABLE lifecycle_events_legacy RENAME TO lifecycle_events")
         existing = connection.execute(
             "SELECT sql FROM sqlite_master WHERE type='table' AND name='skills'"
         ).fetchone()
@@ -191,7 +210,9 @@ class SkillWiki:
             connection.execute("ALTER TABLE skills RENAME TO skills_legacy")
             connection.execute("ALTER TABLE relations RENAME TO relations_legacy")
             connection.execute("ALTER TABLE lifecycle_events RENAME TO lifecycle_events_legacy")
-        connection.executescript(_SCHEMA)
+        for statement in _SCHEMA.split(";"):
+            if statement.strip():
+                connection.execute(statement)
         if not existing or _STATUS_CHECK_SQL in schema_sql:
             return
         legacy_skills = connection.execute("SELECT * FROM skills_legacy").fetchall()
@@ -226,11 +247,9 @@ class SkillWiki:
                 VALUES (:skill_id, :from_status, :to_status, :actor, :reason, :created_at)""",
                 values,
             )
-        connection.executescript(
-            "DROP TABLE lifecycle_events_legacy; "
-            "DROP TABLE relations_legacy; "
-            "DROP TABLE skills_legacy;"
-        )
+        connection.execute("DROP TABLE lifecycle_events_legacy")
+        connection.execute("DROP TABLE relations_legacy")
+        connection.execute("DROP TABLE skills_legacy")
 
     @staticmethod
     def _unavailable() -> SkillWikiResult:
@@ -243,6 +262,7 @@ class SkillWiki:
         *,
         ref: Optional[str] = None,
         commit_sha: Optional[str] = None,
+        previous_local_hash: Optional[str] = None,
     ) -> SkillWikiResult:
         try:
             now = _now()
@@ -257,13 +277,14 @@ class SkillWiki:
                 ).fetchone()
                 modified_count = 0 if existing is None else int(existing["local_modified_count"])
                 if existing is not None:
-                    local_hash = _local_hash(Path(local_path))
+                    local_hash = previous_local_hash or _local_hash(Path(local_path))
                     prior_metadata = _row(existing)["metadata"]
                     prior_local_hash = prior_metadata.get("_last_local_hash")
                     if local_hash is not None and local_hash != existing["content_hash"] and local_hash != prior_local_hash:
                         modified_count += 1
-                    if local_hash is not None:
-                        metadata["_last_local_hash"] = local_hash
+                    current_local_hash = _local_hash(Path(local_path))
+                    if current_local_hash is not None:
+                        metadata["_last_local_hash"] = current_local_hash
                     status = existing["status"]
                     created_at = existing["created_at"]
                     db.execute(

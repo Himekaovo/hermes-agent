@@ -13179,7 +13179,7 @@ def cmd_skills(args):
     else:
         from hermes_cli.skills_hub import skills_command
 
-        skills_command(args)
+        return skills_command(args)
 
 
 def cmd_pairing(args):
@@ -15181,7 +15181,9 @@ def main():
 
     # Execute the command
     if hasattr(args, "func"):
-        args.func(args)
+        result = args.func(args)
+        if isinstance(result, int) and result:
+            sys.exit(result)
     else:
         parser.print_help()
 

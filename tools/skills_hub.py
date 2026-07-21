@@ -576,6 +576,7 @@ class GitHubSource(SkillSource):
         # Survives within a single search/install flow, avoiding redundant API calls.
         self._tree_cache: Dict[str, Tuple[str, List[dict]]] = {}
         self._tree_revisions: Dict[str, str] = {}
+        self._commit_revisions: Dict[str, str] = {}
         # Per-repo cache of the optional skills.sh.json grouping sidecar,
         # mapping skill_name -> human-readable grouping title. ``None`` means
         # "fetched, no sidecar"; a missing key means "not fetched yet".
@@ -653,6 +654,7 @@ class GitHubSource(SkillSource):
         tree = self._get_repo_tree(repo)
         if tree is not None:
             branch, entries = tree
+            self._resolve_commit_sha(repo, branch)
             prefix = f"{skill_path.rstrip('/')}/"
             entries_by_path = {item.get("path", ""): item for item in entries}
             for rel_path in sorted(referenced):
@@ -692,6 +694,8 @@ class GitHubSource(SkillSource):
                     if revision else f"https://github.com/{repo}/{skill_path}"
                 ),
                 "source_revision": revision,
+                "ref": branch,
+                "commit_sha": self._commit_revisions.get(repo),
             },
         )
 
@@ -836,6 +840,24 @@ class GitHubSource(SkillSource):
             self._tree_revisions[repo] = revision
         self._tree_cache[repo] = (default_branch, entries)
         return (default_branch, entries)
+
+    def _resolve_commit_sha(self, repo: str, ref: str) -> Optional[str]:
+        """Resolve the immutable commit behind a branch/ref when provenance needs it."""
+        if repo in self._commit_revisions:
+            return self._commit_revisions[repo]
+        try:
+            response = httpx.get(
+                f"https://api.github.com/repos/{repo}/commits/{ref}",
+                headers=self.auth.get_headers(), timeout=15, follow_redirects=True,
+            )
+            if response.status_code == 200:
+                sha = response.json().get("sha")
+                if isinstance(sha, str) and sha:
+                    self._commit_revisions[repo] = sha
+                    return sha
+        except (httpx.HTTPError, ValueError):
+            pass
+        return None
 
     def _check_rate_limit_response(self, resp: "httpx.Response") -> None:
         """Flag the instance as rate-limited when GitHub returns 403 + exhausted quota."""
@@ -3597,6 +3619,7 @@ def install_from_quarantine(
     # path can never refer to a redirected target.
     install_dir = _resolve_lock_install_path(install_rel_path, safe_skill_name)
 
+    previous_local_hash = content_hash(install_dir) if install_dir.exists() else None
     if install_dir.exists():
         shutil.rmtree(install_dir)
 
@@ -3651,12 +3674,18 @@ def install_from_quarantine(
 
     try:
         from tools.skillwiki import SkillWiki
-        SkillWiki(_hub_dir() / "provenance.db").record_import(
+        provenance_result = SkillWiki(_hub_dir() / "provenance.db").record_import(
             bundle,
             install_dir,
-            ref=bundle.metadata.get("ref"),
+            ref=bundle.metadata.get("ref") or bundle.metadata.get("source_revision"),
             commit_sha=bundle.metadata.get("commit_sha"),
+            previous_local_hash=previous_local_hash,
         )
+        if not provenance_result.available:
+            logger.warning(
+                "SkillWiki provenance unavailable; keeping Hub install: %s",
+                provenance_result.reason,
+            )
     except Exception as exc:
         logger.warning("SkillWiki provenance unavailable; keeping Hub install: %s", exc)
 

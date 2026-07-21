@@ -2,6 +2,7 @@
 
 import argparse
 import json
+from types import SimpleNamespace
 from io import StringIO
 
 import pytest
@@ -95,3 +96,17 @@ def test_wiki_metadata_commands_do_not_create_skill_files(tmp_path):
     assert not (tmp_path / "skills").exists()
     payload = json.loads(console.file.getvalue().splitlines()[-1])
     assert payload["available"] is False
+
+
+def test_skills_command_propagates_wiki_handler_exit_code(monkeypatch):
+    monkeypatch.setattr(cli, "do_wiki_status", lambda *args, **kwargs: 7)
+
+    result = cli.skills_command(SimpleNamespace(
+        skills_action="wiki",
+        wiki_action="status",
+        skill_id="github:acme/a:",
+        new_status="release",
+        reason="",
+    ))
+
+    assert result == 7
