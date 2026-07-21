@@ -21,15 +21,26 @@ except ImportError:  # pragma: no cover - supports a minimal standalone import
 
 LIFECYCLE_STATUSES = (
     "raw",
-    "quarantined",
+    "candidate",
+    "draft",
     "verified",
-    "active",
-    "stale",
-    "archived",
+    "release",
+    "degraded",
     "deprecated",
-    "rejected",
+    "archived",
 )
 RELATIONS = ("inspired_by", "depends_on", "references")
+
+ALLOWED_TRANSITIONS = {
+    "raw": {"candidate", "archived"},
+    "candidate": {"draft", "deprecated", "archived"},
+    "draft": {"verified", "degraded", "deprecated", "archived"},
+    "verified": {"release", "degraded", "deprecated", "archived"},
+    "release": {"degraded", "deprecated", "archived"},
+    "degraded": {"draft", "deprecated", "archived"},
+    "deprecated": {"archived"},
+    "archived": set(),
+}
 
 
 @dataclass
@@ -179,12 +190,12 @@ class SkillWiki:
                 modified_count = 0 if existing is None else int(existing["local_modified_count"])
                 if existing is not None:
                     local_hash = _local_hash(Path(local_path))
-                    if (
-                        local_hash is not None
-                        and local_hash != existing["content_hash"]
-                        and existing["content_hash"] != content_hash
-                    ):
+                    prior_metadata = _row(existing)["metadata"]
+                    prior_local_hash = prior_metadata.get("_last_local_hash")
+                    if local_hash is not None and local_hash != content_hash and local_hash != prior_local_hash:
                         modified_count += 1
+                    if local_hash is not None:
+                        metadata["_last_local_hash"] = local_hash
                     status = existing["status"]
                     created_at = existing["created_at"]
                     db.execute(
@@ -202,6 +213,9 @@ class SkillWiki:
                 else:
                     status = "raw"
                     created_at = now
+                    local_hash = _local_hash(Path(local_path))
+                    if local_hash is not None:
+                        metadata["_last_local_hash"] = local_hash
                     db.execute(
                         """INSERT INTO skills (skill_id, name, source, repo, path, ref,
                         commit_sha, source_url, content_hash, imported_at, local_path,
@@ -288,10 +302,14 @@ class SkillWiki:
         try:
             if to_status not in LIFECYCLE_STATUSES:
                 return SkillWikiResult(False, "invalid_status")
+            if not actor.strip():
+                return SkillWikiResult(False, "invalid_actor")
             with self._connection() as db:
                 current = db.execute("SELECT * FROM skills WHERE skill_id=?", (skill_id,)).fetchone()
                 if current is None:
                     return SkillWikiResult(False, "skill_not_found")
+                if to_status not in ALLOWED_TRANSITIONS[current["status"]]:
+                    return SkillWikiResult(False, "invalid_transition")
                 now = _now()
                 db.execute("UPDATE skills SET status=?, updated_at=? WHERE skill_id=?", (to_status, now, skill_id))
                 db.execute(
@@ -312,8 +330,22 @@ class SkillWiki:
         for skill in skills:
             local_path = Path(skill["local_path"])
             exists = local_path.is_dir()
-            local_hash = _local_hash(local_path) if exists else None
-            checked.append({**skill, "local_path_exists": exists, "content_drift": bool(exists and local_hash != skill["content_hash"])})
+            local_hash = None
+            hash_available = False
+            diagnostic = None
+            if exists:
+                try:
+                    local_hash = _local_hash(local_path)
+                    hash_available = True
+                except OSError:
+                    diagnostic = "local_hash_unavailable"
+            checked.append({
+                **skill,
+                "local_path_exists": exists,
+                "local_hash_available": hash_available,
+                "content_drift": bool(hash_available and exists and local_hash != skill["content_hash"]),
+                **({"diagnostic": diagnostic} if diagnostic else {}),
+            })
         return {"available": True, "reason": None, "skills": checked}
 
     def advisory_evaluation(self, skill_id: Optional[str] = None) -> dict:
