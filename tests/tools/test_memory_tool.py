@@ -7,6 +7,7 @@ from pathlib import Path
 from tools.memory_tool import (
     MemoryStore,
     memory_tool,
+    apply_memory_pending,
     _scan_memory_content,
     MEMORY_SCHEMA,
 )
@@ -283,6 +284,16 @@ class TestMemoryStoreAdd:
         snapshots = list((tmp_path / "l2" / "versions").glob("*.md"))
         assert snapshots
         assert "Python 3.12 project" in snapshots[0].read_text(encoding="utf-8")
+
+    def test_approved_pending_write_still_runs_governance(self, store):
+        path = store._path_for("memory")
+        path.write_text("protected rule\n<!-- SLOW_UPDATE -->", encoding="utf-8")
+        result = apply_memory_pending(
+            {"action": "replace", "target": "memory", "old_text": "protected", "content": "changed rule"},
+            store,
+        )
+        assert result["success"] is False
+        assert result["gate"] == "protected_region"
 
     def test_add_to_user(self, store):
         result = store.add("user", "Name: Alice")
@@ -718,6 +729,16 @@ class TestMemoryBatch:
         assert result["gate"] == "protected_region"
         assert "critical rule" in path.read_text(encoding="utf-8")
         assert "ordinary fact" in path.read_text(encoding="utf-8")
+
+    def test_blocked_batch_creates_no_snapshot(self, store, tmp_path):
+        path = store._path_for("memory")
+        path.write_text("critical rule\n<!-- SLOW_UPDATE -->\n§\nordinary fact", encoding="utf-8")
+        result = store.apply_batch(
+            "memory",
+            [{"action": "replace", "old_text": "critical", "content": "changed rule"}],
+        )
+        assert result["success"] is False
+        assert not list((tmp_path / "l2" / "versions").glob("*.md"))
 
 
 # =========================================================================

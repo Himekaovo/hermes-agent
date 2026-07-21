@@ -42,6 +42,19 @@ def test_snapshot_listing_and_rollback_preserve_previous_bytes(tmp_path: Path):
     assert len(list(versions.glob("*.md"))) == 2
 
 
+def test_rollback_rejects_path_traversal_and_target_mismatch(tmp_path: Path):
+    target = tmp_path / "MEMORY.md"
+    target.write_text("fact", encoding="utf-8")
+    versions = tmp_path / "versions"
+    created = mg.snapshot(target, versions, target="memory", reason="test", operation="add")
+
+    mismatch = mg.rollback(created["id"], target_path=tmp_path / "USER.md", versions_dir=versions, target="user")
+    assert not mismatch["success"]
+    assert "target" in mismatch["error"]
+    traversal = mg.rollback("../../MEMORY.md", target_path=target, versions_dir=versions, target="memory")
+    assert not traversal["success"]
+
+
 def test_protected_entries_detect_slow_update_and_named_regions():
     entries = [
         "stable preference\n<!-- SLOW_UPDATE -->",
@@ -54,6 +67,22 @@ def test_protected_entries_detect_slow_update_and_named_regions():
     assert {item["entry_index"] for item in protected} == {0, 1}
     assert protected[0]["name"] == "SLOW_UPDATE"
     assert protected[1]["name"] == "identity"
+
+
+def test_protected_spans_cross_entries_and_fail_closed_on_malformed_markers():
+    entries = [
+        "<!-- PROTECTED_START: account -->\nname: Himeka",
+        "timezone: Asia/Shanghai",
+        "<!-- PROTECTED_END: account -->\nordinary tail",
+    ]
+    protected = mg.protected_entries(entries)
+    assert {(item["name"], item["entry_index"]) for item in protected} >= {
+        ("account", 0), ("account", 1), ("account", 2)
+    }
+
+    malformed = mg.protected_entries(["<!-- PROTECTED_START: never closed -->", "ordinary"])
+    assert all(item["entry_index"] in {0, 1} for item in malformed)
+    assert any(item.get("malformed") for item in malformed)
 
 
 def test_preflight_blocks_duplicate_and_conflicting_additions(tmp_path: Path):
@@ -103,6 +132,18 @@ def test_preflight_blocks_protected_mutation_and_bad_content(tmp_path: Path):
     assert bad["gate"] == "quality"
 
 
+def test_preflight_uses_distinct_delimiter_reason_code(tmp_path: Path):
+    result = mg.preflight(
+        target="memory",
+        current_entries=[],
+        proposed_entries=["valid fact\n§\nsecond fact"],
+        operation="add",
+        governance_dir=tmp_path / "governance",
+    )
+    assert not result["allowed"]
+    assert result["gate"] == "delimiter_abuse"
+
+
 def test_step_buffer_blocks_repeated_pattern(tmp_path: Path):
     governance = tmp_path / "governance"
     first = mg.record_step(governance, "replace preference with a contradictory rule")
@@ -119,6 +160,35 @@ def test_step_buffer_blocks_repeated_pattern(tmp_path: Path):
     )
     assert not result["allowed"]
     assert result["gate"] == "step_buffer"
+
+
+def test_step_buffer_rejects_empty_and_preserves_malformed_lines(tmp_path: Path):
+    governance = tmp_path / "governance"
+    governance.mkdir(parents=True)
+    path = governance / "step_buffer.jsonl"
+    path.write_text("not json\n", encoding="utf-8")
+    try:
+        mg.record_step(governance, "")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("empty step pattern must be rejected")
+    mg.record_step(governance, "real failed pattern")
+    assert "not json" in path.read_text(encoding="utf-8")
+
+
+def test_meta_skill_aggregates_normalized_strategy_outcomes(tmp_path: Path):
+    governance = tmp_path / "governance"
+    mg.record_meta(governance, "Merge overlapping entries", "success")
+    mg.record_meta(governance, "merge overlapping entries", "failure")
+    result = mg.preflight(
+        target="memory",
+        current_entries=[],
+        proposed_entries=["merge overlapping entries before adding a new fact"],
+        operation="add",
+        governance_dir=governance,
+    )
+    assert result["recommendations"] == []
 
 
 def test_meta_skill_returns_advisory_recommendation(tmp_path: Path):

@@ -11,8 +11,17 @@ hermes memory versions list
 hermes memory versions rollback <version_id> --target memory --yes
 ```
 
+Rollback validates the snapshot sidecar, target, and filename-safe version id;
+the current file is snapshotted before restoration and the restore uses an
+atomic replacement. Snapshot and mutation checks run under the same target
+file lock, including journey edits and deletes.
+
 Entries marked with `<!-- SLOW_UPDATE -->` or a complete named protected span
 cannot be replaced or removed through the memory tool or journey editor.
+Named spans may cross `§`-delimited entries; malformed spans fail closed for
+the affected entries. Journey mutations re-read and compare the selected
+entry while holding the target lock, so a stale index cannot silently modify a
+different entry.
 Near-duplicates, contradictory preference toggles, and malformed delimiter
 content are rejected before mutation. Existing memory approval and atomic file
 writes remain active.

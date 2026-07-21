@@ -82,6 +82,17 @@ def test_journey_delete_refuses_protected_memory(home):
     assert "protected" in result["message"]
 
 
+def test_journey_edit_is_blocked_by_step_buffer(home):
+    from tools import memory_governance
+
+    governance = home / "memories" / "governance"
+    memory_governance.record_step(governance, "rewritten profile")
+    memory_governance.record_step(governance, "rewritten profile")
+    result = lm.edit_node("memory:profile:2", "rewritten profile")
+    assert not result["ok"]
+    assert "step_buffer" in result["message"]
+
+
 def test_edit_memory_replaces_chunk(home):
     assert lm.edit_node("memory:profile:2", "rewritten profile")["ok"]
     assert (home / "memories" / "USER.md").read_text(encoding="utf-8").strip() == "rewritten profile"

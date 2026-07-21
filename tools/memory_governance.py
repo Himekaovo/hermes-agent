@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import tempfile
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -58,10 +61,62 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     return records
 
 
-def _append_jsonl(path: Path, record: dict[str, Any]) -> None:
+@contextmanager
+def _jsonl_lock(path: Path):
+    """Serialize JSONL read-modify-write operations across local processes."""
+    lock_path = path.with_suffix(path.suffix + ".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = lock_path.open("a+", encoding="utf-8")
+    try:
+        try:
+            import fcntl
+
+            fcntl.flock(handle, fcntl.LOCK_EX)
+        except (ImportError, OSError):
+            pass
+        yield
+    finally:
+        try:
+            import fcntl
+
+            fcntl.flock(handle, fcntl.LOCK_UN)
+        except (ImportError, OSError):
+            pass
+        handle.close()
+
+
+def _atomic_write_text(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+    fd, temp_name = tempfile.mkstemp(dir=str(path.parent), prefix=".governance-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_name, path)
+    except BaseException:
+        try:
+            os.unlink(temp_name)
+        except OSError:
+            pass
+        raise
+
+
+def _atomic_write_bytes(path: Path, content: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(dir=str(path.parent), prefix=".governance-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_name, path)
+    except BaseException:
+        try:
+            os.unlink(temp_name)
+        except OSError:
+            pass
+        raise
 
 
 def snapshot(
@@ -78,7 +133,7 @@ def snapshot(
     snapshot_id = f"{created_at.replace(':', '')}-{target}-{digest[:8]}"
     versions_dir.mkdir(parents=True, exist_ok=True)
     snapshot_path = versions_dir / f"{snapshot_id}.md"
-    snapshot_path.write_bytes(raw)
+    _atomic_write_bytes(snapshot_path, raw)
     entries = path.read_text(encoding="utf-8").split("\n§\n") if raw else []
     metadata = {
         "id": snapshot_id,
@@ -91,9 +146,9 @@ def snapshot(
         "entry_count": len(entries),
         "byte_count": len(raw),
     }
-    (versions_dir / f"{snapshot_id}.json").write_text(
+    _atomic_write_text(
+        versions_dir / f"{snapshot_id}.json",
         json.dumps(metadata, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
     )
     return metadata
 
@@ -123,6 +178,17 @@ def rollback(
     versions_dir: Path,
     target: str,
 ) -> dict[str, Any]:
+    if not snapshot_id or Path(snapshot_id).name != snapshot_id or "/" in snapshot_id or "\\" in snapshot_id:
+        return {"success": False, "error": "Invalid snapshot id"}
+    sidecar_path = versions_dir / f"{snapshot_id}.json"
+    try:
+        metadata = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"success": False, "error": f"Snapshot metadata not found: {snapshot_id}"}
+    if not isinstance(metadata, dict) or metadata.get("id") != snapshot_id:
+        return {"success": False, "error": "Snapshot metadata does not match id"}
+    if metadata.get("target") != target:
+        return {"success": False, "error": "Snapshot target does not match rollback target"}
     source = versions_dir / f"{snapshot_id}.md"
     if not source.exists():
         return {"success": False, "error": f"Snapshot not found: {snapshot_id}"}
@@ -135,21 +201,40 @@ def rollback(
             operation="rollback",
         )
     target_path.parent.mkdir(parents=True, exist_ok=True)
-    target_path.write_bytes(source.read_bytes())
+    _atomic_write_bytes(target_path, source.read_bytes())
     return {"success": True, "snapshot_id": snapshot_id, "target": target}
 
 
 def protected_entries(entries: list[str]) -> list[dict[str, Any]]:
     found: list[dict[str, Any]] = []
+    spans: list[tuple[str, int]] = []
+    marked: set[tuple[str, int]] = set()
     for index, entry in enumerate(entries):
         if "<!-- SLOW_UPDATE -->" in entry:
             found.append({"name": "SLOW_UPDATE", "entry_index": index})
-        starts = list(_START_RE.finditer(entry))
-        ends = list(_END_RE.finditer(entry))
-        for start in starts:
-            name = start.group(1).strip()
-            if any(end.group(1).strip() == name and end.start() > start.end() for end in ends):
-                found.append({"name": name, "entry_index": index})
+        markers = []
+        markers.extend((match.start(), "start", match.group(1).strip()) for match in _START_RE.finditer(entry))
+        markers.extend((match.start(), "end", match.group(1).strip()) for match in _END_RE.finditer(entry))
+        for _, kind, name in sorted(markers):
+            if kind == "start":
+                spans.append((name, index))
+                continue
+            matching = next((position for position in range(len(spans) - 1, -1, -1) if spans[position][0] == name), None)
+            if matching is None:
+                found.append({"name": name, "entry_index": index, "malformed": True})
+                continue
+            _, start_index = spans.pop(matching)
+            for protected_index in range(start_index, index + 1):
+                key = (name, protected_index)
+                if key not in marked:
+                    found.append({"name": name, "entry_index": protected_index})
+                    marked.add(key)
+    for name, start_index in spans:
+        for protected_index in range(start_index, len(entries)):
+            key = (name, protected_index)
+            if key not in marked:
+                found.append({"name": name, "entry_index": protected_index, "malformed": True})
+                marked.add(key)
     return found
 
 
@@ -190,10 +275,29 @@ def _preference_signature(entry: str) -> tuple[str, str, str] | None:
 
 def _step_match(governance_dir: Path, summary: str) -> dict[str, Any] | None:
     normalized = _normalize(summary)
-    for record in _read_jsonl(governance_dir / "step_buffer.jsonl"):
+    for record in _aggregate_step_records(_read_jsonl(governance_dir / "step_buffer.jsonl")):
         if record.get("count", 0) >= 2 and _similarity(normalized, str(record.get("normalized_pattern", ""))) >= 0.65:
             return {"pattern": record.get("pattern", ""), "count": record.get("count", 0)}
     return None
+
+
+def _aggregate_step_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    grouped: dict[str, dict[str, Any]] = {}
+    for record in records:
+        normalized = str(record.get("normalized_pattern", "")).strip()
+        if not normalized:
+            continue
+        if normalized not in grouped:
+            grouped[normalized] = dict(record)
+            grouped[normalized]["count"] = int(record.get("count", 1))
+            continue
+        item = grouped[normalized]
+        item["count"] = int(item.get("count", 0)) + int(record.get("count", 1))
+        item["first_seen_at"] = min(item.get("first_seen_at", ""), record.get("first_seen_at", ""))
+        item["last_seen_at"] = max(item.get("last_seen_at", ""), record.get("last_seen_at", ""))
+        if record.get("note"):
+            item["note"] = record["note"]
+    return list(grouped.values())
 
 
 def _recommendations(governance_dir: Path, summary: str) -> list[dict[str, Any]]:
@@ -202,7 +306,8 @@ def _recommendations(governance_dir: Path, summary: str) -> list[dict[str, Any]]
         strategy = str(record.get("strategy", "")).strip()
         if not strategy:
             continue
-        item = grouped.setdefault(strategy, {"strategy": strategy, "successes": 0, "failures": 0})
+        key = _normalize(strategy)
+        item = grouped.setdefault(key, {"strategy": strategy, "successes": 0, "failures": 0})
         item["successes" if record.get("result") == "success" else "failures"] += 1
     return [
         item for item in grouped.values()
@@ -235,7 +340,14 @@ def preflight(
     if impacted and operation in {"replace", "remove", "batch", "journey_edit", "journey_delete"}:
         return {**base, "allowed": False, "gate": "protected_region", "protected": impacted}
 
-    if any("\n§\n" in entry or entry.strip() == "§" for entry in proposed_entries):
+    if any("\n§\n" in entry for entry in proposed_entries):
+        return {**base, "allowed": False, "gate": "delimiter_abuse"}
+    if any(
+        not entry.strip()
+        or entry.strip() == "§"
+        or (len(entry) > 12000 and any(char.isspace() for char in entry))
+        for entry in proposed_entries
+    ):
         return {**base, "allowed": False, "gate": "quality"}
 
     conflicts: list[dict[str, Any]] = []
@@ -278,31 +390,50 @@ def preflight(
 
 
 def record_step(governance_dir: Path, pattern: str, note: str | None = None) -> dict[str, Any]:
+    if not pattern or not pattern.strip():
+        raise ValueError("step pattern cannot be empty")
     normalized = _normalize(pattern)
-    records = _read_jsonl(governance_dir / "step_buffer.jsonl")
-    for record in records:
-        if record.get("normalized_pattern") == normalized:
+    path = governance_dir / "step_buffer.jsonl"
+    with _jsonl_lock(path):
+        lines = path.read_text(encoding="utf-8").splitlines(keepends=True) if path.exists() else []
+        for index, line in enumerate(lines):
+            try:
+                record = json.loads(line)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if not isinstance(record, dict) or record.get("normalized_pattern") != normalized:
+                continue
             record["count"] = int(record.get("count", 0)) + 1
             record["last_seen_at"] = _now()
             if note:
                 record["note"] = note
-            path = governance_dir / "step_buffer.jsonl"
-            path.write_text("".join(json.dumps(item, ensure_ascii=False, sort_keys=True) + "\n" for item in records), encoding="utf-8")
+            lines[index] = json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n"
+            _atomic_write_text(path, "".join(lines))
             return record
-    record = {"pattern": pattern, "normalized_pattern": normalized, "count": 1, "first_seen_at": _now(), "last_seen_at": _now(), "note": note}
-    _append_jsonl(governance_dir / "step_buffer.jsonl", record)
-    return record
+        record = {"pattern": pattern, "normalized_pattern": normalized, "count": 1, "first_seen_at": _now(), "last_seen_at": _now(), "note": note}
+        lines.append(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+        _atomic_write_text(path, "".join(lines))
+        return record
 
 
 def list_steps(governance_dir: Path, limit: int = 20) -> list[dict[str, Any]]:
-    return sorted(_read_jsonl(governance_dir / "step_buffer.jsonl"), key=lambda item: item.get("last_seen_at", ""), reverse=True)[: max(0, limit)]
+    return sorted(
+        _aggregate_step_records(_read_jsonl(governance_dir / "step_buffer.jsonl")),
+        key=lambda item: item.get("last_seen_at", ""),
+        reverse=True,
+    )[: max(0, limit)]
 
 
 def record_meta(governance_dir: Path, strategy: str, result: str, note: str | None = None) -> dict[str, Any]:
+    if not strategy or not strategy.strip():
+        raise ValueError("strategy cannot be empty")
     if result not in {"success", "failure"}:
         raise ValueError("result must be success or failure")
     record = {"strategy": strategy, "result": result, "created_at": _now(), "note": note}
-    _append_jsonl(governance_dir / "meta_skill.jsonl", record)
+    path = governance_dir / "meta_skill.jsonl"
+    with _jsonl_lock(path):
+        existing = path.read_text(encoding="utf-8") if path.exists() else ""
+        _atomic_write_text(path, existing + json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
     return record
 
 

@@ -145,12 +145,17 @@ def _delete_memory(node_id: str) -> dict[str, Any]:
     source, gidx = _parse_memory_id(node_id)
     path, chunks, local = _locate_memory(source, gidx)
 
-    proposed = chunks[:local] + chunks[local + 1:]
-    governed = _govern_memory_change(path, chunks, proposed, "journey_delete")
-    if not governed["ok"]:
-        return governed
-    chunks = proposed
-    _write_memory(path, chunks)
+    from tools.memory_tool import MemoryStore
+
+    with MemoryStore._file_lock(path):
+        fresh = MemoryStore._read_file(path)
+        if not 0 <= local < len(fresh) or fresh[local] != chunks[local]:
+            return {"ok": False, "message": "memory changed while editing — refresh the journey and retry"}
+        proposed = fresh[:local] + fresh[local + 1:]
+        governed = _govern_memory_change(path, fresh, proposed, "journey_delete")
+        if not governed["ok"]:
+            return governed
+        _write_memory(path, proposed)
 
     return {"ok": True, "message": f"deleted memory from {path.name}"}
 
@@ -184,13 +189,18 @@ def _edit_memory(node_id: str, content: str) -> dict[str, Any]:
         return {"ok": False, "message": "empty memory — use delete to remove it"}
     path, chunks, local = _locate_memory(source, gidx)
 
-    proposed = chunks.copy()
-    proposed[local] = body
-    governed = _govern_memory_change(path, chunks, proposed, "journey_edit")
-    if not governed["ok"]:
-        return governed
-    chunks = proposed
-    _write_memory(path, chunks)
+    from tools.memory_tool import MemoryStore
+
+    with MemoryStore._file_lock(path):
+        fresh = MemoryStore._read_file(path)
+        if not 0 <= local < len(fresh) or fresh[local] != chunks[local]:
+            return {"ok": False, "message": "memory changed while editing — refresh the journey and retry"}
+        proposed = fresh.copy()
+        proposed[local] = body
+        governed = _govern_memory_change(path, fresh, proposed, "journey_edit")
+        if not governed["ok"]:
+            return governed
+        _write_memory(path, proposed)
 
     return {"ok": True, "message": f"updated memory in {path.name}"}
 

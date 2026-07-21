@@ -96,6 +96,8 @@ The `.md` file contains the exact pre-write bytes of the target memory file. The
 
 Rollback is manual only. A rollback always snapshots the current file first, then restores the selected `.md` snapshot using the same atomic writer. This prevents a rollback from becoming destructive.
 
+Rollback validates the sidecar target and rejects path-like or traversal-style snapshot ids. Snapshot creation and mutation preflight run inside the target file lock; journey edits and deletes re-read the file under that lock and compare the original selected entry before applying the mutation.
+
 ### Protected regions
 
 Governance parses protected entries and regions from `MEMORY.md` / `USER.md`.
@@ -115,6 +117,8 @@ inside an entry marks the whole entry as protected.
 ```
 
 marks a protected span. Because the existing memory tool mutates `§`-delimited entries, any entry intersecting a protected span is treated as protected.
+
+The span parser carries state across entries, supports nested and same-named spans, and fails closed for unclosed or orphaned markers.
 
 Rules:
 
@@ -138,7 +142,7 @@ Blocked responses include:
 The gate is deterministic and conservative. It blocks only cases that are likely to make local memory worse:
 
 - exact delimiter abuse: content containing the raw `\n§\n` separator;
-- very low quality content such as empty-after-normalization, one-word scraps, or large raw dumps;
+- very low quality content such as empty-after-normalization or large multi-line raw dumps; one-word entries receive a low quality score but remain compatible with the existing curated-memory contract;
 - near-duplicate entries using normalized token overlap / Jaccard similarity;
 - obvious contradictory preference toggles when the same subject has opposing boolean values.
 
@@ -204,6 +208,8 @@ During preflight, governance compares the proposed content and operation summary
 
 The agent may record failures manually through the CLI or a later explicit tool surface. The first implementation does not automatically mine failures from logs.
 
+Step Buffer records are updated under a profile-scoped lock with atomic JSONL replacement. Malformed lines are retained, empty patterns are rejected, and readers aggregate duplicate normalized keys before applying the `count >= 2` gate. Journey edits and deletes use the same gate for repeated failure patterns.
+
 ### Meta Skill
 
 The meta skill records strategy outcomes in:
@@ -232,6 +238,8 @@ Preflight computes lightweight recommendations from strategies with more success
   ]
 }
 ```
+
+Strategy records are normalized and aggregated across success/failure outcomes; a tied or failure-heavy strategy is not recommended.
 
 ## CLI
 
