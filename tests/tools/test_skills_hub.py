@@ -2523,6 +2523,18 @@ class TestGitHubProvenanceRevision:
             ("demo/references/a.md", "commit-a"),
         ]
 
+    def test_fetch_rejects_unresolved_commit_before_reading_files(self, monkeypatch):
+        src = GitHubSource(auth=MagicMock())
+        monkeypatch.setattr(src, "_get_default_branch", lambda _repo: "main")
+        monkeypatch.setattr(src, "_resolve_commit_sha", lambda _repo, _ref: None)
+        read = MagicMock()
+        monkeypatch.setattr(src, "_fetch_file_content", read)
+
+        bundle = src.fetch("acme/demo/demo")
+
+        assert bundle is None
+        read.assert_not_called()
+
 
 # ---------------------------------------------------------------------------
 # parallel_search_sources — overall_timeout must be honoured even when a

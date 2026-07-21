@@ -646,9 +646,16 @@ class GitHubSource(SkillSource):
 
         branch = self._get_default_branch(repo)
         if not branch:
-            branch = None
-        commit_sha = self._resolve_commit_sha(repo, branch) if branch else None
-        pinned_ref = commit_sha or branch
+            logger.warning("Cannot establish GitHub branch for %s; refusing import", identifier)
+            return None
+        commit_sha = self._resolve_commit_sha(repo, branch)
+        if not commit_sha:
+            logger.warning(
+                "Cannot establish immutable GitHub provenance for %s; refusing import",
+                identifier,
+            )
+            return None
+        pinned_ref = commit_sha
         skill_md = self._fetch_file_content(
             repo, f"{skill_path.rstrip('/')}/SKILL.md", ref=pinned_ref
         )
