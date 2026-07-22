@@ -52,6 +52,7 @@ class FactRetriever:
         min_trust: float = 0.3,
         limit: int = 10,
         required_tags: list[str] | str | None = None,
+        mark_retrieved: bool = True,
     ) -> list[dict]:
         """Hybrid search: FTS5 candidates → Jaccard rerank → trust weighting.
 
@@ -64,8 +65,10 @@ class FactRetriever:
         Returns list of dicts with fact data + 'score' field, sorted by score desc.
         """
         # Stage 1: Get FTS5 candidates (more than limit for reranking headroom)
-        candidates = self._fts_candidates(query, category, min_trust, limit * 5)
         routed_tags = self._normalize_tags(required_tags)
+        candidates = self._fts_candidates(
+            query, category, min_trust, limit * 5, required_tags=routed_tags
+        )
 
         if not candidates:
             return []
@@ -129,7 +132,8 @@ class FactRetriever:
         # Strip raw HRR bytes — callers expect JSON-serializable dicts
         for fact in results:
             fact.pop("hrr_vector", None)
-        self._mark_retrieved(results)
+        if mark_retrieved:
+            self._mark_retrieved(results)
         return results
 
     def reconstruct(
@@ -151,7 +155,12 @@ class FactRetriever:
         seen: set[int] = set()
         hops: list[dict] = []
         for hop_query in queries:
-            results = self.search(hop_query, category=category, limit=limit)
+            results = self.search(
+                hop_query,
+                category=category,
+                limit=limit,
+                mark_retrieved=False,
+            )
             hop_ids = []
             for result in results:
                 fact_id = result.get("fact_id")
@@ -602,6 +611,7 @@ class FactRetriever:
         category: str | None,
         min_trust: float,
         limit: int,
+        required_tags: set[str] | None = None,
     ) -> list[dict]:
         """Get raw FTS5 candidates from the store.
 
@@ -623,6 +633,12 @@ class FactRetriever:
         if category:
             where_clauses.append("f.category = ?")
             params.append(category)
+
+        for tag in sorted(required_tags or set()):
+            where_clauses.append(
+                "instr(',' || replace(lower(f.tags), ' ', '') || ',', ',' || ? || ',') > 0"
+            )
+            params.append(tag)
 
         where_clauses.append("f.trust_score >= ?")
         params.append(min_trust)

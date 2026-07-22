@@ -422,3 +422,28 @@ class TestHealthDiagnostics:
         assert result["hops"]
         assert result["evidence"]
         assert "Evidence:" in result["prompt"]
+
+    def test_content_update_preserves_explicit_and_refreshes_auto_tags(self, db_path):
+        store = MemoryStore(db_path)
+        try:
+            fact_id = store.add_fact(
+                "deployment failed", category="project", tags="release"
+            )
+            store.update_fact(fact_id, content="migration completed")
+            preserved = store._conn.execute(
+                "SELECT tags FROM facts WHERE fact_id = ?", (fact_id,)
+            ).fetchone()["tags"].split(",")
+
+            store.update_fact(
+                fact_id, content="deployment migration bug", tags="urgent"
+            )
+            refreshed = store._conn.execute(
+                "SELECT tags FROM facts WHERE fact_id = ?", (fact_id,)
+            ).fetchone()["tags"].split(",")
+        finally:
+            store.close()
+
+        assert "release" in preserved
+        assert "migration" in preserved
+        assert "deployment" not in preserved
+        assert {"urgent", "deployment", "migration", "bug"} <= set(refreshed)

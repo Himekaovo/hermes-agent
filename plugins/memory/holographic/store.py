@@ -332,7 +332,7 @@ class MemoryStore:
         """
         with self._lock:
             row = self._conn.execute(
-                "SELECT fact_id, trust_score, category FROM facts WHERE fact_id = ?",
+                "SELECT fact_id, trust_score, category, tags FROM facts WHERE fact_id = ?",
                 (fact_id,),
             ).fetchone()
             if row is None:
@@ -344,10 +344,28 @@ class MemoryStore:
             if content is not None:
                 assignments.append("content = ?")
                 params.append(content.strip())
-                if tags is None:
-                    assignments.append("tags = ?")
-                    params.append(extract_domain_tags(content, category or row["category"]))
-            if tags is not None:
+                old_tags = {
+                    value.strip().casefold()
+                    for value in (row["tags"] or "").split(",")
+                    if value.strip()
+                }
+                known_auto = set(_DOMAIN_TAG_KEYWORDS) | {str(row["category"]).casefold()}
+                preserved_explicit = old_tags - known_auto
+                requested_explicit = {
+                    value.strip().casefold()
+                    for value in (tags or "").split(",")
+                    if value.strip()
+                }
+                explicit_tags = preserved_explicit | requested_explicit
+                assignments.append("tags = ?")
+                params.append(
+                    extract_domain_tags(
+                        content,
+                        category or row["category"],
+                        ",".join(sorted(explicit_tags)),
+                    )
+                )
+            elif tags is not None:
                 assignments.append("tags = ?")
                 params.append(tags)
             if category is not None:
