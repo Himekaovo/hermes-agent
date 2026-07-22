@@ -447,3 +447,36 @@ class TestHealthDiagnostics:
         assert "migration" in preserved
         assert "deployment" not in preserved
         assert {"urgent", "deployment", "migration", "bug"} <= set(refreshed)
+
+    def test_category_only_update_refreshes_category_tag(self, db_path):
+        store = MemoryStore(db_path)
+        try:
+            fact_id = store.add_fact(
+                "deployment failed", category="project", tags="release"
+            )
+            store.update_fact(fact_id, category="tool")
+            tags = set(
+                store._conn.execute(
+                    "SELECT tags FROM facts WHERE fact_id = ?", (fact_id,)
+                ).fetchone()["tags"].split(",")
+            )
+        finally:
+            store.close()
+
+        assert {"tool", "deployment", "release"} <= tags
+        assert "project" not in tags
+
+    def test_tags_only_update_preserves_generated_tags(self, db_path):
+        store = MemoryStore(db_path)
+        try:
+            fact_id = store.add_fact("deployment failed", category="project")
+            store.update_fact(fact_id, tags="urgent")
+            tags = set(
+                store._conn.execute(
+                    "SELECT tags FROM facts WHERE fact_id = ?", (fact_id,)
+                ).fetchone()["tags"].split(",")
+            )
+        finally:
+            store.close()
+
+        assert {"urgent", "project", "deployment", "bug"} <= tags
