@@ -95,7 +95,7 @@ _RE_AKA          = re.compile(
 _DOMAIN_TAG_KEYWORDS = {
     "deployment": ("deploy", "deployment", "发布", "部署", "上线"),
     "migration": ("migration", "迁移", "schema"),
-    "bug": ("bug", "error", "failure", "失败", "错误", "修复"),
+    "bug": ("bug", "error", "failure", "failed", "失败", "错误", "修复"),
     "memory": ("memory", "记忆", "recall", "检索"),
     "project": ("project", "项目", "repo", "repository"),
     "preference": ("prefer", "喜欢", "偏好", "习惯"),
@@ -332,7 +332,7 @@ class MemoryStore:
         """
         with self._lock:
             row = self._conn.execute(
-                "SELECT fact_id, trust_score, category, tags FROM facts WHERE fact_id = ?",
+                "SELECT fact_id, content, trust_score, category, tags FROM facts WHERE fact_id = ?",
                 (fact_id,),
             ).fetchone()
             if row is None:
@@ -340,10 +340,16 @@ class MemoryStore:
 
             assignments: list[str] = ["updated_at = CURRENT_TIMESTAMP"]
             params: list = []
+            new_content = content.strip() if content is not None else row["content"]
+            new_category = category if category is not None else row["category"]
 
             if content is not None:
                 assignments.append("content = ?")
-                params.append(content.strip())
+                params.append(new_content)
+            if category is not None:
+                assignments.append("category = ?")
+                params.append(new_category)
+            if content is not None or category is not None or tags is not None:
                 old_tags = {
                     value.strip().casefold()
                     for value in (row["tags"] or "").split(",")
@@ -360,17 +366,11 @@ class MemoryStore:
                 assignments.append("tags = ?")
                 params.append(
                     extract_domain_tags(
-                        content,
-                        category or row["category"],
+                        new_content,
+                        new_category,
                         ",".join(sorted(explicit_tags)),
                     )
                 )
-            elif tags is not None:
-                assignments.append("tags = ?")
-                params.append(tags)
-            if category is not None:
-                assignments.append("category = ?")
-                params.append(category)
             if trust_delta is not None:
                 new_trust = _clamp_trust(row["trust_score"] + trust_delta)
                 assignments.append("trust_score = ?")
