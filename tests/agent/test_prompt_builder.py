@@ -425,6 +425,37 @@ class TestBuildSkillsSystemPrompt:
         assert "Debug Python scripts" in result
         assert "available_skills" in result
 
+    def test_renders_compact_skill_summary_instead_of_long_description(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        skill_dir = tmp_path / "skills" / "tools" / "deploy"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: deploy\ndescription: "
+            + ("This long description should not enter the index. " * 20)
+            + "\nmetadata:\n  hermes:\n    compact:\n      triggers: deploy production\n"
+            "      steps: load; run; verify\n      warnings: needs credentials\n---\n\nBody.\n"
+        )
+        result = build_skills_system_prompt()
+        assert "T: deploy production | S: load; run; verify | W: needs credentials" in result
+        assert "This long description should not enter the index" not in result
+
+    def test_legacy_snapshot_version_is_ignored(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        skill_dir = tmp_path / "skills" / "tools" / "fresh"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: fresh\ndescription: Fresh skill\n---\n\nBody.\n"
+        )
+        snapshot = tmp_path / ".skills_prompt_snapshot.json"
+        snapshot.write_text(
+            '{"version": 1, "manifest": {}, "skills": [], "category_descriptions": {}}'
+        )
+        result = build_skills_system_prompt()
+        assert "fresh" in result
+        assert "T: Fresh skill" in result
+
     def test_deduplicates_skills(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         cat_dir = tmp_path / "skills" / "tools"
@@ -1699,5 +1730,4 @@ class TestParallelToolCallGuidance:
 # =========================================================================
 # Budget warning history stripping
 # =========================================================================
-
 

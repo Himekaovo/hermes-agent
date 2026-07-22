@@ -58,6 +58,12 @@ Frontmatter:
   when the dependency is genuinely platform-bound. Omit the field for portable
   skills.
 - metadata.hermes.tags: a few Capitalized, Relevant, Tags.
+- metadata.hermes.compact: author the three short system-prompt fields below.
+  - triggers: phrases or situations that should activate this skill.
+  - steps: the 3-5 essential actions, separated by semicolons.
+  - warnings: the main failure modes, limits, or negative conditions.
+  Keep the rendered `T: ... | S: ... | W: ...` summary <=200 characters;
+  keep the full procedure and detail in the body or support files.
 
 Body section order (omit a section only if it genuinely has no content):
 1. "# <Human Title>" then a 2-3 sentence intro: what it does, what it does NOT

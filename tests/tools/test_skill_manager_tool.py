@@ -116,6 +116,18 @@ class TestValidateFrontmatter:
     def test_valid_content(self):
         assert _validate_frontmatter(VALID_SKILL_CONTENT) is None
 
+    def test_oversized_compact_summary_is_rejected(self):
+        content = (
+            "---\nname: test\ndescription: desc\n"
+            "metadata:\n  hermes:\n    compact:\n      triggers: '"
+            + ("x" * 201)
+            + "'\n---\n\nBody.\n"
+        )
+        assert "200" in _validate_frontmatter(content)
+
+    def test_compact_summary_is_optional_for_legacy_skills(self):
+        assert _validate_frontmatter(VALID_SKILL_CONTENT) is None
+
     def test_empty_content(self):
         assert _validate_frontmatter("") == "Content cannot be empty."
         assert _validate_frontmatter("   ") == "Content cannot be empty."

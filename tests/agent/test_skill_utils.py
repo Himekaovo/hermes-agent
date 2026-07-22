@@ -37,6 +37,62 @@ def test_metadata_as_dict_with_hermes():
     assert result["requires_tools"] == ["tool_y"]
 
 
+def test_compact_skill_summary_uses_nested_three_field_metadata():
+    from agent.skill_utils import extract_compact_skill_summary
+
+    frontmatter = {
+        "metadata": {
+            "hermes": {
+                "compact": {
+                    "triggers": "when deploying",
+                    "steps": "load; run; verify",
+                    "warnings": "needs credentials",
+                }
+            }
+        }
+    }
+
+    assert extract_compact_skill_summary(frontmatter, "legacy") == (
+        "T: when deploying | S: load; run; verify | W: needs credentials"
+    )
+
+
+def test_compact_skill_summary_accepts_top_level_aliases_and_caps_length():
+    from agent.skill_utils import extract_compact_skill_summary
+
+    long = "x" * 120
+    result = extract_compact_skill_summary(
+        {"triggers": long, "steps": long, "warnings": long}, "fallback"
+    )
+
+    assert len(result) <= 200
+    assert result.startswith("T: ")
+    assert " | S: " in result
+    assert " | W: " in result
+
+
+def test_compact_skill_summary_legacy_fallback_is_bounded():
+    from agent.skill_utils import extract_compact_skill_summary
+
+    result = extract_compact_skill_summary({}, "legacy description " * 100)
+
+    assert len(result) <= 200
+    assert result.startswith("T: legacy description")
+    assert "S: load via skill_view(name)" in result
+    assert "W: see full skill" in result
+
+
+def test_validate_compact_skill_summary_only_rejects_explicit_oversized_metadata():
+    from agent.skill_utils import validate_compact_skill_summary
+
+    assert validate_compact_skill_summary({"description": "legacy"}) is None
+    error = validate_compact_skill_summary(
+        {"metadata": {"hermes": {"compact": {"triggers": "x" * 201}}}}
+    )
+    assert error is not None
+    assert "200" in error
+
+
 def test_metadata_as_string_does_not_crash():
     """Bug case: metadata is a non-dict truthy value (e.g. a YAML string)."""
     frontmatter = {"metadata": "some text"}

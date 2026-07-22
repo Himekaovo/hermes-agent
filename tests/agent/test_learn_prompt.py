@@ -63,6 +63,14 @@ class TestBuildLearnPrompt:
         # The single most-violated rule must be explicit in the prompt.
         assert "60" in _AUTHORING_STANDARDS
 
+    def test_compact_summary_fields_are_in_the_standards(self):
+        standards = _AUTHORING_STANDARDS.lower()
+        assert "metadata.hermes.compact" in standards
+        assert "triggers" in standards
+        assert "steps" in standards
+        assert "warnings" in standards
+        assert "200" in standards
+
     def test_teaches_the_full_hardline_standards(self):
         # description length — otherwise distilled skills miss platform gating,
         # author credit, and the tool-framing table. Lock the coverage in.
