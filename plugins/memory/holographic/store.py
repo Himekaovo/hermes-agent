@@ -92,6 +92,37 @@ _RE_AKA          = re.compile(
     re.IGNORECASE,
 )
 
+_DOMAIN_TAG_KEYWORDS = {
+    "deployment": ("deploy", "deployment", "发布", "部署", "上线"),
+    "migration": ("migration", "迁移", "schema"),
+    "bug": ("bug", "error", "failure", "失败", "错误", "修复"),
+    "memory": ("memory", "记忆", "recall", "检索"),
+    "project": ("project", "项目", "repo", "repository"),
+    "preference": ("prefer", "喜欢", "偏好", "习惯"),
+}
+
+
+def extract_domain_tags(content: str, category: str = "", explicit: str = "") -> str:
+    """Return stable explicit/category/domain tags for local routing.
+
+    This is deliberately lexical and offline. It enriches tag routing without
+    asking a model to rewrite or infer the stored fact.
+    """
+    text = (content or "").casefold()
+    tags: list[str] = []
+    for raw in (explicit or "").split(","):
+        tag = raw.strip().casefold()
+        if tag and tag not in tags:
+            tags.append(tag)
+    for tag in (category or "").split(","):
+        tag = tag.strip().casefold()
+        if tag and tag not in tags:
+            tags.append(tag)
+    for tag, keywords in _DOMAIN_TAG_KEYWORDS.items():
+        if any(keyword.casefold() in text for keyword in keywords) and tag not in tags:
+            tags.append(tag)
+    return ",".join(tags)
+
 
 def _clamp_trust(value: float) -> float:
     return max(_TRUST_MIN, min(_TRUST_MAX, value))
@@ -205,6 +236,7 @@ class MemoryStore:
             content = content.strip()
             if not content:
                 raise ValueError("content must not be empty")
+            tags = extract_domain_tags(content, category, tags)
 
             try:
                 cur = self._conn.execute(
@@ -300,7 +332,8 @@ class MemoryStore:
         """
         with self._lock:
             row = self._conn.execute(
-                "SELECT fact_id, trust_score FROM facts WHERE fact_id = ?", (fact_id,)
+                "SELECT fact_id, trust_score, category FROM facts WHERE fact_id = ?",
+                (fact_id,),
             ).fetchone()
             if row is None:
                 return False
@@ -311,6 +344,9 @@ class MemoryStore:
             if content is not None:
                 assignments.append("content = ?")
                 params.append(content.strip())
+                if tags is None:
+                    assignments.append("tags = ?")
+                    params.append(extract_domain_tags(content, category or row["category"]))
             if tags is not None:
                 assignments.append("tags = ?")
                 params.append(tags)

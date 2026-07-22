@@ -145,6 +145,36 @@ def test_search_result_explains_why_fact_was_recalled(retriever_with_facts):
     assert "deployment" in reason["summary"].lower()
 
 
+def test_tokenize_keeps_chinese_terms_and_english_words():
+    tokens = FactRetriever._tokenize("部署 Hermes agent")
+
+    assert "部署" in tokens
+    assert "hermes" in tokens
+    assert "agent" in tokens
+
+
+def test_search_can_route_by_tags(retriever_with_facts):
+    retriever_with_facts.store.add_fact(
+        "Deployment rollback runbook", category="project", tags="release,ops"
+    )
+    results = retriever_with_facts.search("deployment", required_tags=["release"])
+
+    assert results
+    assert {"release", "ops", "deployment"} <= set(results[0]["tags"].split(","))
+    assert "tag_overlap" in results[0]["reason"]["signals"]
+
+
+def test_reconstruct_returns_deterministic_multihop_evidence(retriever_with_facts):
+    result = retriever_with_facts.reconstruct(
+        "deployment rollback", entities=["deployment", "migration"], limit=3
+    )
+
+    assert result["query"] == "deployment rollback"
+    assert len(result["hops"]) == 3
+    assert result["evidence"]
+    assert "deployment rollback" in result["prompt"].lower()
+
+
 def test_search_marks_recalled_facts_as_used(tmp_path):
     """A recalled fact should record when it was last used."""
     store = MemoryStore(str(tmp_path / "test_facts.db"))
