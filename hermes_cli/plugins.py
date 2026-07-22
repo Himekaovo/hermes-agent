@@ -2104,8 +2104,10 @@ def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
 
     Returns a list of non-``None`` return values from plugin callbacks.
     """
-    results = get_plugin_manager().invoke_hook(hook_name, **kwargs)
-    return results + _invoke_instance_hook(hook_name, **kwargs)
+    payload = dict(kwargs)
+    payload.setdefault("telemetry_schema_version", OBSERVER_SCHEMA_VERSION)
+    results = get_plugin_manager().invoke_hook(hook_name, **payload)
+    return results + _invoke_instance_hook(hook_name, **payload)
 
 
 def invoke_middleware(kind: str, **kwargs: Any) -> List[Any]:

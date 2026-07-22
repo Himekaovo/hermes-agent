@@ -1,4 +1,5 @@
 from hermes_cli import plugins
+from hermes_cli.plugins import OBSERVER_SCHEMA_VERSION
 
 
 def test_invoke_hook_combines_global_and_active_instance_callbacks(monkeypatch):
@@ -54,3 +55,42 @@ def test_instance_hook_callbacks_are_isolated_from_input_mapping(monkeypatch):
     with plugins.scoped_hook_overrides(callbacks):
         callbacks["test_event"].append(second)
         assert plugins.invoke_hook("test_event") == ["first"]
+
+
+def test_global_and_instance_hooks_receive_same_schema_version(monkeypatch):
+    manager = plugins.PluginManager()
+    monkeypatch.setattr(plugins, "_plugin_manager", manager)
+    seen = []
+
+    def global_hook(**kwargs):
+        seen.append(("global", kwargs["telemetry_schema_version"]))
+
+    def instance_hook(**kwargs):
+        seen.append(("instance", kwargs["telemetry_schema_version"]))
+
+    manager._hooks["test_event"] = [global_hook]
+    with plugins.scoped_hook_overrides({"test_event": [instance_hook]}):
+        plugins.invoke_hook("test_event")
+
+    assert seen == [
+        ("global", OBSERVER_SCHEMA_VERSION),
+        ("instance", OBSERVER_SCHEMA_VERSION),
+    ]
+
+
+def test_explicit_schema_version_reaches_global_and_instance_hooks(monkeypatch):
+    manager = plugins.PluginManager()
+    monkeypatch.setattr(plugins, "_plugin_manager", manager)
+    seen = []
+
+    def global_hook(**kwargs):
+        seen.append(kwargs["telemetry_schema_version"])
+
+    def instance_hook(**kwargs):
+        seen.append(kwargs["telemetry_schema_version"])
+
+    manager._hooks["test_event"] = [global_hook]
+    with plugins.scoped_hook_overrides({"test_event": [instance_hook]}):
+        plugins.invoke_hook("test_event", telemetry_schema_version="custom")
+
+    assert seen == ["custom", "custom"]
