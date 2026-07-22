@@ -32,12 +32,23 @@ Config in `config.yaml` under `plugins.hermes-memory-store`:
 
 | Tool | Description |
 |------|-------------|
-| `fact_store` | 10 actions: add, search, probe, related, reason, contradict, diagnose, update, remove, list |
+| `fact_store` | 11 actions: add, search, probe, related, reason, reconstruct, contradict, diagnose, update, remove, list |
 | `fact_feedback` | Rate facts as helpful/unhelpful (trains trust scores) |
 
 Search results include a `reason` object explaining why the fact was recalled:
 matched query terms, scoring signals, and a short summary. Prefetched memory
 context includes the same summary inline so recalled context is reviewable.
+
+Facts receive deterministic local domain tags from their category and content
+(for example `deployment`, `migration`, `bug`, and `memory`) while preserving
+explicit tags. Search can route to facts containing all requested tags with
+`filter_tags`. Mixed English/Chinese tokenization contributes to overlap
+scoring without requiring a new package.
+
+Use `action="reconstruct"` for a read-only multi-hop evidence pack. It runs a
+base query plus optional entity hops and returns the hop fact IDs, deduplicated
+evidence, and a prompt-shaped evidence block. It does not write or rewrite
+memory.
 
 `fact_store` with `action="diagnose"` returns a local memory health report:
 near duplicates, stale facts, low-trust facts, simple consistency checks, and

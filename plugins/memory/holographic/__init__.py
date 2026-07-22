@@ -47,6 +47,7 @@ FACT_STORE_SCHEMA = {
         "• probe — Entity recall: ALL facts about a person/thing.\n"
         "• related — What connects to an entity? Structural adjacency.\n"
         "• reason — Compositional: facts connected to MULTIPLE entities simultaneously.\n"
+        "• reconstruct — Build a read-only multi-hop evidence pack for reasoning.\n"
         "• contradict — Memory hygiene: find facts making conflicting claims.\n"
         "• diagnose — Memory health report: duplicates, stale facts, low trust, index checks.\n"
         "• update/remove/list — CRUD operations.\n\n"
@@ -57,12 +58,13 @@ FACT_STORE_SCHEMA = {
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["add", "search", "probe", "related", "reason", "contradict", "diagnose", "update", "remove", "list"],
+                "enum": ["add", "search", "probe", "related", "reason", "reconstruct", "contradict", "diagnose", "update", "remove", "list"],
             },
             "content": {"type": "string", "description": "Fact content (required for 'add')."},
             "query": {"type": "string", "description": "Search query (required for 'search')."},
             "entity": {"type": "string", "description": "Entity name for 'probe'/'related'."},
             "entities": {"type": "array", "items": {"type": "string"}, "description": "Entity names for 'reason'."},
+            "filter_tags": {"type": "array", "items": {"type": "string"}, "description": "All tags a search result must contain."},
             "fact_id": {"type": "integer", "description": "Fact ID for 'update'/'remove'."},
             "category": {"type": "string", "enum": ["user_pref", "project", "tool", "general"]},
             "tags": {"type": "string", "description": "Comma-separated tags."},
@@ -296,6 +298,7 @@ class HolographicMemoryProvider(MemoryProvider):
                     category=args.get("category"),
                     min_trust=float(args.get("min_trust", self._min_trust)),
                     limit=int(args.get("limit", 10)),
+                    required_tags=args.get("filter_tags"),
                 )
                 return json.dumps({"results": results, "count": len(results)})
 
@@ -325,6 +328,15 @@ class HolographicMemoryProvider(MemoryProvider):
                     limit=int(args.get("limit", 10)),
                 )
                 return json.dumps({"results": results, "count": len(results)})
+
+            elif action == "reconstruct":
+                result = retriever.reconstruct(
+                    args.get("query", ""),
+                    entities=args.get("entities", []),
+                    category=args.get("category"),
+                    limit=int(args.get("limit", 10)),
+                )
+                return json.dumps(result)
 
             elif action == "contradict":
                 results = retriever.contradict(

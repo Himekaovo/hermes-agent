@@ -51,6 +51,7 @@ class FactRetriever:
         category: str | None = None,
         min_trust: float = 0.3,
         limit: int = 10,
+        required_tags: list[str] | str | None = None,
     ) -> list[dict]:
         """Hybrid search: FTS5 candidates → Jaccard rerank → trust weighting.
 
@@ -63,7 +64,8 @@ class FactRetriever:
         Returns list of dicts with fact data + 'score' field, sorted by score desc.
         """
         # Stage 1: Get FTS5 candidates (more than limit for reranking headroom)
-        candidates = self._fts_candidates(query, category, min_trust, limit * 3)
+        candidates = self._fts_candidates(query, category, min_trust, limit * 5)
+        routed_tags = self._normalize_tags(required_tags)
 
         if not candidates:
             return []
@@ -73,9 +75,15 @@ class FactRetriever:
         scored = []
 
         for fact in candidates:
+            fact_tags = self._normalize_tags(fact.get("tags", ""))
+            if routed_tags and not routed_tags.issubset(fact_tags):
+                continue
             content_tokens = self._tokenize(fact["content"])
             tag_tokens = self._tokenize(fact.get("tags", ""))
             all_tokens = content_tokens | tag_tokens
+            tag_overlap = self._jaccard_similarity(
+                self._tokenize(query), tag_tokens
+            )
 
             jaccard = self._jaccard_similarity(query_tokens, all_tokens)
             fts_score = fact.get("fts_rank", 0.0)
@@ -94,7 +102,7 @@ class FactRetriever:
                         + self.hrr_weight * hrr_sim)
 
             # Trust weighting
-            score = relevance * fact["trust_score"]
+            score = (relevance + (0.1 * tag_overlap)) * fact["trust_score"]
 
             # Optional temporal decay
             decay = 1.0
@@ -111,6 +119,7 @@ class FactRetriever:
                 hrr_sim=hrr_sim,
                 trust_score=fact["trust_score"],
                 temporal_decay=decay,
+                tag_overlap=tag_overlap,
             )
             scored.append(fact)
 
@@ -122,6 +131,48 @@ class FactRetriever:
             fact.pop("hrr_vector", None)
         self._mark_retrieved(results)
         return results
+
+    def reconstruct(
+        self,
+        query: str,
+        *,
+        entities: list[str] | None = None,
+        category: str | None = None,
+        limit: int = 10,
+    ) -> dict:
+        """Build a deterministic multi-hop evidence pack for an L2 prompt.
+
+        Retrieval remains read-only: each hop searches the same fact store and
+        the returned prompt is evidence, not an instruction to write memory.
+        """
+        queries = [query.strip()] if query and query.strip() else []
+        queries.extend(str(entity).strip() for entity in (entities or []) if str(entity).strip())
+        evidence: list[dict] = []
+        seen: set[int] = set()
+        hops: list[dict] = []
+        for hop_query in queries:
+            results = self.search(hop_query, category=category, limit=limit)
+            hop_ids = []
+            for result in results:
+                fact_id = result.get("fact_id")
+                if fact_id not in seen:
+                    seen.add(fact_id)
+                    evidence.append(result)
+                if fact_id is not None:
+                    hop_ids.append(fact_id)
+            hops.append({"query": hop_query, "fact_ids": hop_ids})
+
+        lines = [f"Question: {query}", "Evidence:"]
+        for fact in evidence[: max(1, int(limit))]:
+            lines.append(
+                f"- [{fact.get('category', 'general')}] {fact.get('content', '')}"
+            )
+        return {
+            "query": query,
+            "hops": hops,
+            "evidence": evidence[: max(1, int(limit))],
+            "prompt": "\n".join(lines),
+        }
 
     def probe(
         self,
@@ -515,6 +566,7 @@ class FactRetriever:
         hrr_sim: float,
         trust_score: float,
         temporal_decay: float,
+        tag_overlap: float = 0.0,
     ) -> dict:
         """Explain why a fact was recalled using deterministic ranking signals."""
         matched_terms = sorted(query_tokens & fact_tokens)
@@ -524,6 +576,7 @@ class FactRetriever:
             "hrr": round(float(hrr_sim), 3),
             "trust": round(float(trust_score), 3),
             "temporal_decay": round(float(temporal_decay), 3),
+            "tag_overlap": round(float(tag_overlap), 3),
         }
         if matched_terms:
             term_text = ", ".join(matched_terms[:6])
@@ -612,19 +665,32 @@ class FactRetriever:
 
     @staticmethod
     def _tokenize(text: str) -> set[str]:
-        """Simple whitespace tokenization with lowercasing.
+        """Tokenize mixed English/Chinese text without a mandatory dependency.
 
-        Strips common punctuation. No stemming/lemmatization (Phase 1).
+        English words remain compatible with the original whitespace tokenizer;
+        CJK runs also contribute characters and bigrams so Chinese queries do
+        not collapse to an empty overlap set.
         """
         if not text:
             return set()
-        # Split on whitespace, lowercase, strip punctuation
-        tokens = set()
-        for word in text.lower().split():
-            cleaned = word.strip(".,;:!?\"'()[]{}#@<>")
-            if cleaned:
-                tokens.add(cleaned)
+        import re
+
+        tokens: set[str] = set()
+        for word in re.findall(r"[a-z0-9_]+|[\u3400-\u9fff]+", text.casefold()):
+            if re.fullmatch(r"[\u3400-\u9fff]+", word):
+                tokens.add(word)
+                tokens.update(word)
+                tokens.update(word[index : index + 2] for index in range(len(word) - 1))
+            else:
+                tokens.add(word)
         return tokens
+
+    @staticmethod
+    def _normalize_tags(tags: list[str] | str | None) -> set[str]:
+        if not tags:
+            return set()
+        values = tags.split(",") if isinstance(tags, str) else tags
+        return {str(tag).strip().casefold() for tag in values if str(tag).strip()}
 
     # Stopwords dropped before FTS5 OR-expansion. Short English function
     # words that carry no retrieval signal and force false-negative AND

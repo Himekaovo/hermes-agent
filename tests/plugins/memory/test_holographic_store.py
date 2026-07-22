@@ -18,6 +18,15 @@ import threading
 import pytest
 
 from plugins.memory.holographic.store import MemoryStore
+from plugins.memory.holographic.store import extract_domain_tags
+
+
+def test_extract_domain_tags_merges_explicit_and_known_terms():
+    tags = extract_domain_tags(
+        "Deployment rollback fixed the migration bug", "project", "release"
+    )
+
+    assert tags.split(",") == ["release", "project", "deployment", "migration", "bug"]
 
 
 @pytest.fixture(autouse=True)
@@ -386,3 +395,30 @@ class TestHealthDiagnostics:
         assert "low_trust" in result
         assert "inconsistencies" in result
         assert "recommendations" in result
+
+    def test_fact_store_reconstruct_action_returns_evidence_prompt(self, db_path):
+        from plugins.memory.holographic import HolographicMemoryProvider
+
+        provider = HolographicMemoryProvider(config={"db_path": str(db_path)})
+        provider.initialize("reconstruct-session")
+        try:
+            provider._store.add_fact(
+                "Deployment rollback depends on migration state.", category="project"
+            )
+            result = json.loads(
+                provider.handle_tool_call(
+                    "fact_store",
+                    {
+                        "action": "reconstruct",
+                        "query": "deployment rollback",
+                        "entities": ["migration"],
+                        "limit": 3,
+                    },
+                )
+            )
+        finally:
+            provider.shutdown()
+
+        assert result["hops"]
+        assert result["evidence"]
+        assert "Evidence:" in result["prompt"]
