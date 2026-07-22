@@ -573,6 +573,12 @@ def _validate_frontmatter(content: str) -> Optional[str]:
     if len(str(parsed["description"])) > MAX_DESCRIPTION_LENGTH:
         return f"Description exceeds {MAX_DESCRIPTION_LENGTH} characters."
 
+    from agent.skill_utils import validate_compact_skill_summary
+
+    compact_error = validate_compact_skill_summary(parsed)
+    if compact_error:
+        return compact_error
+
     body = content[end_match.end() + 3:].strip()
     if not body:
         return "SKILL.md must have content after the frontmatter (instructions, procedures, etc.)."

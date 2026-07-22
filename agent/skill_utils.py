@@ -16,6 +16,9 @@ from hermes_constants import get_config_path, get_skills_dir, is_termux
 
 logger = logging.getLogger(__name__)
 
+COMPACT_SKILL_SUMMARY_MAX_CHARS = 200
+_COMPACT_FIELD_NAMES = ("triggers", "steps", "warnings")
+
 # ── Platform mapping ──────────────────────────────────────────────────────
 
 PLATFORM_MAP = {
@@ -167,6 +170,75 @@ def parse_frontmatter(content: str) -> Tuple[Dict[str, Any], str]:
             frontmatter[key.strip()] = value.strip()
 
     return frontmatter, body
+
+
+def _compact_value(value: Any) -> str:
+    """Normalize a compact-summary field without importing a schema library."""
+    if isinstance(value, (list, tuple)):
+        value = "; ".join(str(item) for item in value)
+    elif not isinstance(value, str):
+        value = str(value)
+    return " ".join(value.split()).strip()
+
+
+def _compact_metadata(frontmatter: Dict[str, Any]) -> Dict[str, str]:
+    """Read nested compact metadata, with top-level aliases for authoring ease."""
+    metadata = frontmatter.get("metadata")
+    hermes = metadata.get("hermes") if isinstance(metadata, dict) else None
+    nested = hermes.get("compact") if isinstance(hermes, dict) else None
+    nested = nested if isinstance(nested, dict) else {}
+
+    values: Dict[str, str] = {}
+    for field in _COMPACT_FIELD_NAMES:
+        value = nested.get(field)
+        if value is None and field in frontmatter:
+            value = frontmatter[field]
+        if value is not None:
+            values[field] = _compact_value(value)
+    return values
+
+
+def _render_compact_summary(values: Dict[str, str]) -> str:
+    """Render T/S/W fields, trimming values deterministically to the budget."""
+    separators = ("T: ", " | S: ", " | W: ")
+    available = COMPACT_SKILL_SUMMARY_MAX_CHARS - sum(len(item) for item in separators)
+    fields = [_compact_value(values.get(field, "-")) or "-" for field in _COMPACT_FIELD_NAMES]
+    # Allocate the remaining room fairly, then give unused room to earlier fields.
+    budgets = [available // 3] * 3
+    for index in range(available % 3):
+        budgets[index] += 1
+    fields = [value[:budget].rstrip() or "-" for value, budget in zip(fields, budgets)]
+    return f"T: {fields[0]} | S: {fields[1]} | W: {fields[2]}"
+
+
+def validate_compact_skill_summary(frontmatter: Dict[str, Any]) -> Optional[str]:
+    """Validate explicitly authored compact metadata; legacy skills are allowed."""
+    values = _compact_metadata(frontmatter)
+    if not values:
+        return None
+    raw = "T: {0} | S: {1} | W: {2}".format(
+        values.get("triggers", "-"), values.get("steps", "-"), values.get("warnings", "-")
+    )
+    if len(raw) > COMPACT_SKILL_SUMMARY_MAX_CHARS:
+        return (
+            "Compact skill summary exceeds "
+            f"{COMPACT_SKILL_SUMMARY_MAX_CHARS} characters."
+        )
+    return None
+
+
+def extract_compact_skill_summary(
+    frontmatter: Dict[str, Any], description: str = ""
+) -> str:
+    """Return the bounded T/S/W summary used in the system-prompt skill index."""
+    values = _compact_metadata(frontmatter)
+    if not values:
+        values = {
+            "triggers": _compact_value(description) or "-",
+            "steps": "load via skill_view(name)",
+            "warnings": "see full skill",
+        }
+    return _render_compact_summary(values)
 
 
 # ── Platform matching ─────────────────────────────────────────────────────
