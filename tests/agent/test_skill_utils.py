@@ -71,6 +71,47 @@ def test_compact_skill_summary_accepts_top_level_aliases_and_caps_length():
     assert " | W: " in result
 
 
+def test_valid_unbalanced_compact_summary_is_not_truncated():
+    from agent.skill_utils import extract_compact_skill_summary
+
+    triggers = "x" * 100
+    result = extract_compact_skill_summary(
+        {
+            "metadata": {
+                "hermes": {
+                    "compact": {
+                        "triggers": triggers,
+                        "steps": "run",
+                        "warnings": "none",
+                    }
+                }
+            }
+        }
+    )
+
+    assert f"T: {triggers}" in result
+    assert len(result) <= 200
+
+
+def test_partial_compact_metadata_uses_field_fallbacks():
+    from agent.skill_utils import extract_compact_skill_summary
+
+    result = extract_compact_skill_summary(
+        {
+            "metadata": {
+                "hermes": {"compact": {"triggers": "deploy production"}}
+            }
+        },
+        "legacy description",
+    )
+
+    assert result == (
+        "T: deploy production | "
+        "S: load via skill_view(name) | "
+        "W: see full skill"
+    )
+
+
 def test_compact_skill_summary_legacy_fallback_is_bounded():
     from agent.skill_utils import extract_compact_skill_summary
 

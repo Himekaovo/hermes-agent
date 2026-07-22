@@ -199,15 +199,22 @@ def _compact_metadata(frontmatter: Dict[str, Any]) -> Dict[str, str]:
 
 
 def _render_compact_summary(values: Dict[str, str]) -> str:
-    """Render T/S/W fields, trimming values deterministically to the budget."""
+    """Render T/S/W fields, trimming only when the complete result is too long."""
     separators = ("T: ", " | S: ", " | W: ")
     available = COMPACT_SKILL_SUMMARY_MAX_CHARS - sum(len(item) for item in separators)
     fields = [_compact_value(values.get(field, "-")) or "-" for field in _COMPACT_FIELD_NAMES]
-    # Allocate the remaining room fairly, then give unused room to earlier fields.
-    budgets = [available // 3] * 3
-    for index in range(available % 3):
-        budgets[index] += 1
-    fields = [value[:budget].rstrip() or "-" for value, budget in zip(fields, budgets)]
+    if sum(len(value) for value in fields) > available:
+        # Preserve short fields in full and take the excess from the longest
+        # field first. This avoids imposing an undocumented per-field limit.
+        excess = sum(len(value) for value in fields) - available
+        while excess > 0:
+            index = max(range(len(fields)), key=lambda item: len(fields[item]))
+            removable = max(0, len(fields[index]) - 1)
+            if not removable:
+                break
+            reduction = min(excess, removable)
+            fields[index] = fields[index][: len(fields[index]) - reduction].rstrip() or "-"
+            excess -= reduction
     return f"T: {fields[0]} | S: {fields[1]} | W: {fields[2]}"
 
 
@@ -238,6 +245,10 @@ def extract_compact_skill_summary(
             "steps": "load via skill_view(name)",
             "warnings": "see full skill",
         }
+    else:
+        values.setdefault("triggers", _compact_value(description) or "-")
+        values.setdefault("steps", "load via skill_view(name)")
+        values.setdefault("warnings", "see full skill")
     return _render_compact_summary(values)
 
 
