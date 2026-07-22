@@ -175,6 +175,50 @@ def test_reconstruct_returns_deterministic_multihop_evidence(retriever_with_fact
     assert "deployment rollback" in result["prompt"].lower()
 
 
+def test_reconstruct_does_not_change_retrieval_metadata(tmp_path):
+    store = MemoryStore(str(tmp_path / "reconstruct_readonly.db"))
+    try:
+        fact_id = store.add_fact(
+            "Deployment rollback depends on migration state.", category="project"
+        )
+        before = store._conn.execute(
+            "SELECT retrieval_count, last_retrieved_at FROM facts WHERE fact_id = ?",
+            (fact_id,),
+        ).fetchone()
+        retriever = FactRetriever(store=store)
+
+        retriever.reconstruct(
+            "deployment rollback", entities=["deployment", "migration"], limit=3
+        )
+
+        after = store._conn.execute(
+            "SELECT retrieval_count, last_retrieved_at FROM facts WHERE fact_id = ?",
+            (fact_id,),
+        ).fetchone()
+    finally:
+        store.close()
+
+    assert after["retrieval_count"] == before["retrieval_count"]
+    assert after["last_retrieved_at"] == before["last_retrieved_at"]
+
+
+def test_tag_routing_happens_before_candidate_limit(tmp_path):
+    store = MemoryStore(str(tmp_path / "tag_routing.db"))
+    try:
+        for index in range(55):
+            store.add_fact(f"deployment candidate without release tag {index}")
+        target_id = store.add_fact(
+            "deployment candidate with release tag", tags="release"
+        )
+        results = FactRetriever(store=store).search(
+            "deployment", required_tags=["release"], limit=10
+        )
+    finally:
+        store.close()
+
+    assert any(result["fact_id"] == target_id for result in results)
+
+
 def test_search_marks_recalled_facts_as_used(tmp_path):
     """A recalled fact should record when it was last used."""
     store = MemoryStore(str(tmp_path / "test_facts.db"))
