@@ -202,6 +202,26 @@ def test_reconstruct_does_not_change_retrieval_metadata(tmp_path):
     assert after["last_retrieved_at"] == before["last_retrieved_at"]
 
 
+def test_reconstruct_expands_next_hop_from_first_hop_tags(tmp_path):
+    store = MemoryStore(str(tmp_path / "reconstruct_hops.db"))
+    try:
+        store.add_fact(
+            "Deployment failure was caused by migration state.",
+            category="project",
+            tags="release,migration",
+        )
+        result = FactRetriever(store=store).reconstruct(
+            "deployment failure", limit=3
+        )
+    finally:
+        store.close()
+
+    assert len(result["hops"]) >= 2
+    assert any(
+        hop["query"] in {"release", "migration"} for hop in result["hops"][1:]
+    )
+
+
 def test_tag_routing_happens_before_candidate_limit(tmp_path):
     store = MemoryStore(str(tmp_path / "tag_routing.db"))
     try:

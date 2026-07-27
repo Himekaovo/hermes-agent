@@ -65,6 +65,7 @@ FACT_STORE_SCHEMA = {
             "entity": {"type": "string", "description": "Entity name for 'probe'/'related'."},
             "entities": {"type": "array", "items": {"type": "string"}, "description": "Entity names for 'reason'."},
             "filter_tags": {"type": "array", "items": {"type": "string"}, "description": "All tags a search result must contain."},
+            "max_hops": {"type": "integer", "description": "Maximum reconstruct hops (default: 3, max: 5)."},
             "fact_id": {"type": "integer", "description": "Fact ID for 'update'/'remove'."},
             "category": {"type": "string", "enum": ["user_pref", "project", "tool", "general"]},
             "tags": {"type": "string", "description": "Comma-separated tags."},
@@ -335,6 +336,7 @@ class HolographicMemoryProvider(MemoryProvider):
                     entities=args.get("entities", []),
                     category=args.get("category"),
                     limit=int(args.get("limit", 10)),
+                    max_hops=int(args.get("max_hops", 3)),
                 )
                 return json.dumps(result)
 
