@@ -205,21 +205,57 @@ def test_reconstruct_does_not_change_retrieval_metadata(tmp_path):
 def test_reconstruct_expands_next_hop_from_first_hop_tags(tmp_path):
     store = MemoryStore(str(tmp_path / "reconstruct_hops.db"))
     try:
-        store.add_fact(
-            "Deployment failure was caused by migration state.",
+        first_id = store.add_fact(
+            "Deployment failure occurred during rollout.",
             category="project",
-            tags="release,migration",
+            tags="migration",
+        )
+        second_id = store.add_fact(
+            "Migration state was stale because schema version 7 was incomplete.",
+            category="project",
+            tags="migration,schema",
         )
         result = FactRetriever(store=store).reconstruct(
-            "deployment failure", limit=3
+            "deployment rollout failure", limit=10, max_hops=3
         )
     finally:
         store.close()
 
-    assert len(result["hops"]) >= 2
-    assert any(
-        hop["query"] in {"release", "migration"} for hop in result["hops"][1:]
+    assert result["hops"][0]["query"] == "deployment rollout failure"
+    assert first_id in result["hops"][0]["fact_ids"]
+    assert second_id not in result["hops"][0]["fact_ids"]
+
+    migration_hop = next(
+        hop for hop in result["hops"] if hop["query"] == "migration"
     )
+    assert second_id in migration_hop["fact_ids"]
+    evidence_ids = {fact["fact_id"] for fact in result["evidence"]}
+    assert {first_id, second_id} <= evidence_ids
+
+
+def test_reconstruct_clamps_hop_count_and_deduplicates_cues(tmp_path):
+    store = MemoryStore(str(tmp_path / "reconstruct_hop_limits.db"))
+    try:
+        store.add_fact(
+            "Deployment migration needs a release checklist.",
+            category="project",
+            tags="migration,Migration,MIGRATION",
+        )
+        result = FactRetriever(store=store).reconstruct(
+            "deployment", limit=10, max_hops=99
+        )
+        minimum = FactRetriever(store=store).reconstruct(
+            "deployment", limit=10, max_hops=0
+        )
+    finally:
+        store.close()
+
+    assert len(result["hops"]) <= 5
+    assert len(minimum["hops"]) <= 1
+    migration_queries = [
+        hop["query"] for hop in result["hops"] if hop["query"] == "migration"
+    ]
+    assert migration_queries == ["migration"]
 
 
 def test_tag_routing_happens_before_candidate_limit(tmp_path):
