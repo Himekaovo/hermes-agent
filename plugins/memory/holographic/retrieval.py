@@ -143,18 +143,27 @@ class FactRetriever:
         entities: list[str] | None = None,
         category: str | None = None,
         limit: int = 10,
+        max_hops: int = 3,
     ) -> dict:
         """Build a deterministic multi-hop evidence pack for an L2 prompt.
 
         Retrieval remains read-only: each hop searches the same fact store and
         the returned prompt is evidence, not an instruction to write memory.
         """
+        max_hops = max(1, min(5, int(max_hops)))
         queries = [query.strip()] if query and query.strip() else []
-        queries.extend(str(entity).strip() for entity in (entities or []) if str(entity).strip())
+        queries.extend(
+            str(entity).strip() for entity in (entities or []) if str(entity).strip()
+        )
         evidence: list[dict] = []
         seen: set[int] = set()
         hops: list[dict] = []
-        for hop_query in queries:
+        visited_queries: set[str] = set()
+        while queries and len(hops) < max_hops:
+            hop_query = queries.pop(0)
+            if hop_query.casefold() in visited_queries:
+                continue
+            visited_queries.add(hop_query.casefold())
             results = self.search(
                 hop_query,
                 category=category,
@@ -170,6 +179,19 @@ class FactRetriever:
                 if fact_id is not None:
                     hop_ids.append(fact_id)
             hops.append({"query": hop_query, "fact_ids": hop_ids})
+
+            # Cue-driven expansion: tags are the lightweight bridge between
+            # the current evidence and the next search hop. Caller-provided
+            # entities remain first in the queue; automatic cues fill spare
+            # hops only when the queue has room.
+            for result in results[:3]:
+                category_tag = str(result.get("category", "")).casefold()
+                for raw_cue in str(result.get("tags", "")).split(","):
+                    cue = raw_cue.strip().casefold()
+                    if not cue or cue in {"general", category_tag}:
+                        continue
+                    if cue not in visited_queries and cue not in queries:
+                        queries.append(cue)
 
         lines = [f"Question: {query}", "Evidence:"]
         for fact in evidence[: max(1, int(limit))]:
