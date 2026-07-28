@@ -16,6 +16,7 @@ from .contracts import MnemosyneConfig
 _LOCKS: dict[str, threading.RLock] = {}
 _LOCKS_GUARD = threading.Lock()
 L4_RELATIVE_PATH = Path("memories") / "mnemosyne" / "l4.jsonl"
+_READ_TIME_FIELDS = ("decay_score", "age_days", "archive_recommended", "read_state")
 
 
 class SecurityInvariantError(RuntimeError):
@@ -87,10 +88,8 @@ class L4CandidateRecord:
         payload.setdefault("created_at", _now_iso())
         payload.setdefault("last_validated_at", None)
         payload.setdefault("archived_at", None)
-        payload.pop("decay_score", None)
-        payload.pop("age_days", None)
-        payload.pop("archive_recommended", None)
-        payload.pop("read_state", None)
+        for field in _READ_TIME_FIELDS:
+            payload.pop(field, None)
         if (
             payload["parent_session_id"] is not None
             and not isinstance(payload["parent_session_id"], str)
@@ -101,6 +100,17 @@ class L4CandidateRecord:
         if "\n" in json.dumps(payload, sort_keys=True, ensure_ascii=False):
             raise ValueError("L4 record must serialize to one JSONL line")
         return cls(payload=payload, record_id=record_id)
+
+
+def _persistence_payload(record: L4CandidateRecord) -> dict[str, object]:
+    payload = dict(record.payload)
+    for field in _READ_TIME_FIELDS:
+        payload.pop(field, None)
+    payload.setdefault("parent_session_id", None)
+    if payload["parent_session_id"] is not None and not isinstance(payload["parent_session_id"], str):
+        raise ValueError("parent_session_id must be a string or None")
+    payload["record_id"] = record.record_id
+    return payload
 
 
 def assert_trusted_path(path: Path, root: Path) -> Path:
@@ -182,7 +192,7 @@ class L4Store:
         except SecurityInvariantError:
             self._disabled = True
             raise
-        line_text = json.dumps(record.payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        line_text = json.dumps(_persistence_payload(record), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         if "\n" in line_text or len(line_text) > self.config.max_l4_record_chars:
             return {"written": False, "reason": "record_too_large"}
         line = (line_text + "\n").encode("utf-8")

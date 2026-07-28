@@ -272,6 +272,27 @@ def test_l4_mapping_read_state_is_not_persisted(tmp_path):
     assert "read_state" not in persisted
 
 
+def test_l4_write_resanitizes_mutated_candidate_payload(tmp_path):
+    from plugins.memory.mnemosyne.contracts import MnemosyneConfig
+    from plugins.memory.mnemosyne.l4_store import L4CandidateRecord, L4Store
+
+    store = L4Store(tmp_path, profile_id="coder", config=MnemosyneConfig.from_mapping({}))
+    record = L4CandidateRecord.from_mapping(_l4_record())
+    record.payload.update({
+        "read_state": {"age_days": 7, "decay_score": 0.8, "archive_recommended": False},
+        "decay_score": 0.8,
+        "age_days": 7,
+        "archive_recommended": False,
+    })
+
+    assert store.write_candidate(record)["written"] is True
+    persisted = json.loads(store.path.read_text(encoding="utf-8"))
+    assert "read_state" not in persisted
+    assert "decay_score" not in persisted
+    assert "age_days" not in persisted
+    assert "archive_recommended" not in persisted
+
+
 def test_l4_parent_session_id_type_and_none_id_are_distinct_from_empty():
     from plugins.memory.mnemosyne.l4_store import L4CandidateRecord
 
