@@ -32,6 +32,7 @@ _SKILL_INTENT_KEYWORDS = {
     "来源",
     "能力",
 }
+_SKILL_INTENT_SUBSTRINGS = {"安装", "工具", "技能", "来源", "能力"}
 _INACTIVE_SKILL_STATUSES = {"archived", "deprecated", "degraded", "disabled"}
 
 
@@ -54,6 +55,9 @@ def is_skill_intent(
     query: str,
     known_skill_names: set[str] | None = None,
 ) -> bool:
+    normalized_query = (query or "").casefold()
+    if any(keyword in normalized_query for keyword in _SKILL_INTENT_SUBSTRINGS):
+        return True
     tokens = _query_tokens(query)
     if not tokens:
         return False
@@ -74,6 +78,12 @@ def _l2_reason(row: object) -> tuple[str, tuple[tuple[str, object], ...]]:
     return str(reason_obj.get("summary") or "holographic recall"), freeze_reason_detail(
         {key: value for key, value in detail.items() if value not in (None, "")}
     )
+
+
+def _l2_float(value: object) -> float:
+    if value is None:
+        raise ValueError("missing numeric value")
+    return float(value)
 
 
 def collect_l2_items(
@@ -99,24 +109,32 @@ def collect_l2_items(
         }]
 
     items: list[MnemosyneItem] = []
+    diagnostics: list[dict[str, object]] = []
     for row in rows or []:
         fact_id = _row_get(row, "fact_id")
-        reason, reason_detail = _l2_reason(row)
-        trust = _row_get(row, "trust_score", 0.5)
-        score = _row_get(row, "score", trust)
-        items.append(MnemosyneItem(
-            item_id=f"L2:fact:{fact_id}",
-            layer="L2",
-            content=str(_row_get(row, "content", "") or ""),
-            reason=reason,
-            reason_code="l2_retrieval_reason",
-            reason_detail=reason_detail,
-            score=float(score),
-            source="holographic",
-            provenance=(),
-            trust=float(trust),
-        ))
-    return items, []
+        try:
+            reason, reason_detail = _l2_reason(row)
+            trust = _l2_float(_row_get(row, "trust_score", 0.5))
+            score = _l2_float(_row_get(row, "score", trust))
+            items.append(MnemosyneItem(
+                item_id=f"L2:fact:{fact_id}",
+                layer="L2",
+                content=str(_row_get(row, "content", "") or ""),
+                reason=reason,
+                reason_code="l2_retrieval_reason",
+                reason_detail=reason_detail,
+                score=score,
+                source="holographic",
+                provenance=(),
+                trust=trust,
+            ))
+        except (TypeError, ValueError):
+            diagnostics.append({
+                "reason": "l2_row_invalid",
+                "layer": "L2",
+                "fact_id": fact_id,
+            })
+    return items, diagnostics
 
 
 def _skill_rows(result: object) -> list[object]:
