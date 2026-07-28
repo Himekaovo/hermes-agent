@@ -20,6 +20,7 @@
 - Pre hooks only read memory/SkillWiki; post hooks only produce candidates and audit results; session-end persistence is the only path that may submit a candidate to Memory Governance.
 - Hook order is explicit: pre `identity -> mode -> delegation/context -> recall -> security`; post `egress -> verification -> A2A metadata -> generic postprocessing`; session-end `session-archiver`.
 - Verification states are `passed`, `failed`, `not_run`, and `unavailable`; text claims such as `tests passed` are not verification evidence.
+- Missing `session_id` is an explicit identity violation and returns `BLOCK`; checker exceptions, malformed input, timeouts, and inability to decide return `ERROR`.
 - Do not add runtime dependencies or change Memory Provider public APIs.
 - Keep `.superpowers/` untracked and out of every commit.
 

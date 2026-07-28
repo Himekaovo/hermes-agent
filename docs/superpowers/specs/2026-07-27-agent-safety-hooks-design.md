@@ -162,6 +162,8 @@ Hook 抛异常、超时、畸形输入或无法判断 → ERROR，然后按该�
 - `post_llm_call`：`BLOCK` 阻断用户可见响应；`ERROR` 保留原始安全响应并记录；
 - `on_session_end`：任何结果都不能阻止归档和 cleanup。
 
+缺少 `session_id` 属于明确的身份违规，因此由 `identity-hook` 返回 `BLOCK`；只有检查器抛异常、超时、输入畸形或无法判断时才返回 `ERROR`。
+
 ### Structured execution context
 
 每个 Hook payload 必须带有或明确标记以下字段：
