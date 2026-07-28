@@ -109,6 +109,8 @@ class MnemosyneConfig:
     hard_layer_caps: dict[str, int]
     max_l4_file_chars: int
     max_l4_record_chars: int
+    cron_multiplier: float
+    subagent_multiplier: float
 
     @classmethod
     def from_mapping(
@@ -161,4 +163,8 @@ class MnemosyneConfig:
             hard_layer_caps=hard,
             max_l4_file_chars=int(data.get("max_l4_file_chars", 1048576)),
             max_l4_record_chars=int(data.get("max_l4_record_chars", 4096)),
+            cron_multiplier=float(data.get("cron_multiplier", DEFAULT_CRON_MULTIPLIER)),
+            subagent_multiplier=float(
+                data.get("subagent_multiplier", DEFAULT_SUBAGENT_MULTIPLIER)
+            ),
         )
