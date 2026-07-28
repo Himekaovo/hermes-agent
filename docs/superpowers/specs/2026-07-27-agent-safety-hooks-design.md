@@ -129,7 +129,7 @@ global plugins → built-in safety hooks → instance override hooks
     "event": "pre_llm_call",
     "action": "allow",  # allow | warn | block | error | skip
     "reason_code": "prompt_injection_detected",
-    "risk_level": "high",  # low | medium | high
+    "risk_level": "high",  # low | medium | high | critical | unknown
     "message": "Human-readable explanation",
     "metadata": {
         "session_id": "...",
@@ -185,7 +185,7 @@ Hook 抛异常、超时、畸形输入或无法判断 → ERROR，然后按该�
 
 阶段顺序与行为：
 
-- `pre_llm_call` 固定顺序为 `identity → mode → delegation/context → recall → security`，其中 `BLOCK` 阻止当前模型调用；
+- `pre_llm_call` 固定顺序为 `identity → mode → delegation → recall → context propagation → security`，其中 `BLOCK` 阻止当前模型调用；
 - `post_llm_call` 固定顺序为 `egress → verification → A2A metadata → generic postprocessing`，其中 egress 针对原始输出执行；
 - `on_session_end` 只有 `session-archiver`，任何结果都不能阻止清理流程；
 - 单个 callback 异常由现有 Hook 隔离逻辑捕获，并记录为 `ERROR` 结果；dispatcher 策略对这类异常保持 fail-open，只有显式 `BLOCK` 结果才阻止当前调用。

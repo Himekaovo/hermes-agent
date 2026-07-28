@@ -18,7 +18,7 @@
 - Trusted execution context includes `agent_id`, `execution_kind` (`interactive`, `cron`, or `subagent`), `parent_session_id`, `session_id`, `task_id`, and `turn_id`; execution kind is never inferred from prompt text.
 - Memory writes remain governed by Memory Governance; safety hooks never write memory or Skill files directly.
 - Pre hooks only read memory/SkillWiki; post hooks only produce candidates and audit results; session-end persistence is the only path that may submit a candidate to Memory Governance.
-- Hook order is explicit: pre `identity -> mode -> delegation/context -> recall -> security`; post `egress -> verification -> A2A metadata -> generic postprocessing`; session-end `session-archiver`.
+- Hook order is explicit: pre `identity -> mode -> delegation -> recall -> context propagation -> security`; post `egress -> verification -> A2A metadata -> generic postprocessing`; session-end `session-archiver`.
 - Verification states are `passed`, `failed`, `not_run`, and `unavailable`; text claims such as `tests passed` are not verification evidence.
 - Missing `session_id` is an explicit identity violation and returns `BLOCK`; checker exceptions, malformed input, timeouts, and inability to decide return `ERROR`.
 - Do not add runtime dependencies or change Memory Provider public APIs.
