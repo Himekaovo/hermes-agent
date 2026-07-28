@@ -103,6 +103,181 @@ def test_provider_discovery_loads_mnemosyne():
     assert "Memory Tower" in provider.system_prompt_block()
 
 
+def test_provider_initialize_stores_metadata_and_scales_subagent_config(tmp_path):
+    from plugins.memory.mnemosyne import MnemosyneProvider
+
+    provider = MnemosyneProvider({"total_char_budget": 6001})
+
+    provider.initialize(
+        "child",
+        hermes_home=str(tmp_path),
+        agent_identity="coder",
+        agent_context="subagent",
+        agent_id="agent-child",
+        execution_kind="subagent",
+        parent_session_id="parent",
+    )
+
+    assert provider._session_id == "child"
+    assert provider._parent_session_id == "parent"
+    assert provider._profile_id == "coder"
+    assert provider._agent_id == "agent-child"
+    assert provider._execution_kind == "subagent"
+    assert provider._config.total_char_budget == 3000
+
+
+def test_provider_sync_turn_buffers_without_touching_l4_file(tmp_path):
+    from plugins.memory.mnemosyne import MnemosyneProvider
+
+    provider = MnemosyneProvider({"l4_candidate_observation": True})
+    provider.initialize(
+        "s1",
+        hermes_home=str(tmp_path),
+        agent_identity="coder",
+        agent_context="primary",
+        agent_id="agent-main",
+        execution_kind="interactive",
+    )
+
+    provider.sync_turn("User prefers rollback first.", "I will remember candidate.")
+
+    assert not (tmp_path / "memories" / "mnemosyne" / "l4.jsonl").exists()
+    assert len(provider._candidate_buffer) == 1
+
+
+def test_provider_session_end_writes_l4_once_with_parent_session_id(tmp_path):
+    from plugins.memory.mnemosyne import MnemosyneProvider
+
+    provider = MnemosyneProvider({"l4_candidate_observation": True})
+    provider.initialize(
+        "child",
+        hermes_home=str(tmp_path),
+        agent_identity="coder",
+        agent_context="subagent",
+        agent_id="agent-child",
+        execution_kind="subagent",
+        parent_session_id="parent",
+    )
+    provider.sync_turn("Migration failed.", "Use rollback first.")
+
+    messages = [{"role": "user", "content": "Migration failed."}]
+    provider.on_session_end(messages)
+    provider.on_session_end(messages)
+
+    raw = (
+        tmp_path / "memories" / "mnemosyne" / "l4.jsonl"
+    ).read_text(encoding="utf-8").splitlines()
+    assert len(raw) == 1
+    payload = json.loads(raw[0])
+    assert payload["parent_session_id"] == "parent"
+    assert payload["execution_kind"] == "subagent"
+
+
+def test_provider_on_memory_write_observes_successful_writes_idempotently(tmp_path):
+    from plugins.memory.mnemosyne import MnemosyneProvider
+
+    provider = MnemosyneProvider({"l4_candidate_observation": True})
+    provider.initialize(
+        "s1",
+        hermes_home=str(tmp_path),
+        agent_identity="coder",
+        agent_id="agent-main",
+        execution_kind="interactive",
+    )
+
+    provider.on_memory_write("add", "user", "User wants concise Chinese summaries.")
+    provider.on_memory_write("add", "user", "User wants concise Chinese summaries.")
+    provider.on_session_end([])
+
+    raw = (
+        tmp_path / "memories" / "mnemosyne" / "l4.jsonl"
+    ).read_text(encoding="utf-8").splitlines()
+    assert len(raw) == 1
+    payload = json.loads(raw[0])
+    assert payload["kind"] == "reflection"
+    assert payload["content"] == "User wants concise Chinese summaries."
+
+
+def test_provider_prefetch_returns_empty_on_security_invariant_failure(tmp_path):
+    from plugins.memory.mnemosyne import MnemosyneProvider
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    memories = tmp_path / "memories"
+    memories.mkdir()
+    (memories / "mnemosyne").symlink_to(outside)
+    provider = MnemosyneProvider()
+    provider.initialize("s1", hermes_home=str(tmp_path), agent_identity="coder")
+
+    assert provider.prefetch("anything") == ""
+    assert provider._disabled is True
+
+
+def test_provider_prefetch_fails_open_with_available_l1_when_l4_missing(tmp_path):
+    from plugins.memory.mnemosyne import MnemosyneProvider
+
+    memory_dir = tmp_path / "memories"
+    memory_dir.mkdir()
+    (memory_dir / "MEMORY.md").write_text(
+        "Prefer rollback-first recovery.",
+        encoding="utf-8",
+    )
+    provider = MnemosyneProvider()
+    provider.initialize("s1", hermes_home=str(tmp_path), agent_identity="coder")
+
+    block = provider.prefetch("rollback")
+
+    assert "Prefer rollback-first recovery." in block
+    assert "Mnemosyne Memory Tower" in block
+
+
+def test_provider_prefetch_fails_open_with_available_l1_when_l4_unavailable(tmp_path):
+    from plugins.memory.mnemosyne import MnemosyneProvider
+
+    mnemosyne_dir = tmp_path / "memories" / "mnemosyne"
+    mnemosyne_dir.mkdir(parents=True)
+    (tmp_path / "memories" / "MEMORY.md").write_text(
+        "Prefer rollback-first recovery.",
+        encoding="utf-8",
+    )
+    (mnemosyne_dir / "l4.jsonl").mkdir()
+    provider = MnemosyneProvider()
+    provider.initialize("s1", hermes_home=str(tmp_path), agent_identity="coder")
+
+    block = provider.prefetch("rollback")
+
+    assert "Prefer rollback-first recovery." in block
+
+
+def test_provider_prefetch_includes_sensitive_l1_only_for_interactive_root(tmp_path):
+    from plugins.memory.mnemosyne import MnemosyneProvider
+
+    memory_dir = tmp_path / "memories"
+    memory_dir.mkdir()
+    (memory_dir / "MEMORY.md").write_text("General memory.", encoding="utf-8")
+    (memory_dir / "USER.md").write_text("Sensitive user profile.", encoding="utf-8")
+
+    root_provider = MnemosyneProvider()
+    root_provider.initialize(
+        "s1",
+        hermes_home=str(tmp_path),
+        agent_identity="coder",
+        execution_kind="interactive",
+    )
+    subagent_provider = MnemosyneProvider()
+    subagent_provider.initialize(
+        "child",
+        hermes_home=str(tmp_path),
+        agent_identity="coder",
+        execution_kind="subagent",
+        parent_session_id="parent",
+    )
+
+    assert "Sensitive user profile." in root_provider.prefetch("profile")
+    assert "General memory." in subagent_provider.prefetch("profile")
+    assert "Sensitive user profile." not in subagent_provider.prefetch("profile")
+
+
 def _l4_record(**overrides):
     base = {
         "kind": "lesson",
