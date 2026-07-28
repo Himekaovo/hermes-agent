@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import json
 import os
 import tempfile
@@ -51,11 +52,19 @@ def _canonical_source_refs(source_refs: object) -> str:
     return json.dumps(normalized, sort_keys=True, separators=(",", ":"))
 
 
+def _canonical_parent_session_id(value: object) -> str:
+    if value is None:
+        return "null"
+    if not isinstance(value, str):
+        raise ValueError("parent_session_id must be a string or None")
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
 def candidate_record_id(record: Mapping[str, object]) -> str:
     key = "\0".join([
         str(record.get("profile_id") or ""),
         str(record.get("session_id") or ""),
-        str(record.get("parent_session_id") or ""),
+        _canonical_parent_session_id(record.get("parent_session_id")),
         str(record.get("agent_id") or ""),
         str(record.get("execution_kind") or ""),
         str(record.get("kind") or ""),
@@ -81,6 +90,12 @@ class L4CandidateRecord:
         payload.pop("decay_score", None)
         payload.pop("age_days", None)
         payload.pop("archive_recommended", None)
+        payload.pop("read_state", None)
+        if (
+            payload["parent_session_id"] is not None
+            and not isinstance(payload["parent_session_id"], str)
+        ):
+            raise ValueError("parent_session_id must be a string or None")
         record_id = candidate_record_id(payload)
         payload["record_id"] = record_id
         if "\n" in json.dumps(payload, sort_keys=True, ensure_ascii=False):
@@ -132,6 +147,7 @@ class L4Store:
 
     def ensure_available(self) -> None:
         assert_trusted_path(self.path.parent, self.hermes_home)
+        assert_trusted_path(self.path, self.hermes_home)
 
     def _lock(self) -> threading.RLock:
         key = str(self.path)
@@ -143,9 +159,20 @@ class L4Store:
             return lock
 
     def _read_raw_lines(self) -> list[bytes]:
+        self.ensure_available()
         if not self.path.exists():
             return []
-        return self.path.read_bytes().splitlines(keepends=True)
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            fd = os.open(self.path, flags)
+        except OSError as exc:
+            if self.path.is_symlink() or exc.errno == errno.ELOOP:
+                raise SecurityInvariantError(f"path traverses symlink: {self.path}") from exc
+            raise
+        with os.fdopen(fd, "rb") as handle:
+            return handle.read().splitlines(keepends=True)
 
     def write_candidate(self, record: L4CandidateRecord) -> dict[str, object]:
         if self._disabled:
@@ -160,6 +187,7 @@ class L4Store:
             return {"written": False, "reason": "record_too_large"}
         line = (line_text + "\n").encode("utf-8")
         with self._lock():
+            self.ensure_available()
             raw_lines = self._read_raw_lines()
             valid_ids = set()
             for raw in raw_lines:
@@ -171,16 +199,21 @@ class L4Store:
                     valid_ids.add(parsed["record_id"])
             if record.record_id in valid_ids:
                 return {"written": False, "reason": "duplicate"}
-            final = b"".join(raw_lines) + line
+            existing = b"".join(raw_lines)
+            separator = b"" if not existing or existing.endswith((b"\n", b"\r")) else b"\n"
+            final = existing + separator + line
             if len(final.decode("utf-8", errors="ignore")) > self.config.max_l4_file_chars:
                 return {"written": False, "reason": "file_too_large"}
+            self.ensure_available()
             self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.ensure_available()
             fd, tmp_name = tempfile.mkstemp(prefix=".l4-", suffix=".tmp", dir=str(self.path.parent))
             try:
                 with os.fdopen(fd, "wb") as handle:
                     handle.write(final)
                     handle.flush()
                     os.fsync(handle.fileno())
+                self.ensure_available()
                 os.replace(tmp_name, self.path)
                 try:
                     dir_fd = os.open(str(self.path.parent), os.O_DIRECTORY)
@@ -207,7 +240,12 @@ class L4Store:
         except SecurityInvariantError as exc:
             self._disabled = True
             return [], [{"reason": "security_invariant_failure", "message": str(exc)}]
-        for index, raw in enumerate(self._read_raw_lines()):
+        try:
+            raw_lines = self._read_raw_lines()
+        except SecurityInvariantError as exc:
+            self._disabled = True
+            return [], [{"reason": "security_invariant_failure", "message": str(exc)}]
+        for index, raw in enumerate(raw_lines):
             try:
                 parsed = json.loads(raw.decode("utf-8"))
             except Exception:
