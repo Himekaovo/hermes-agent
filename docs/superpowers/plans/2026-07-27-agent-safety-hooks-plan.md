@@ -31,6 +31,8 @@
 **Files:**
 - Create: `agent/safety_hooks.py`
 - Create: `tests/agent/test_safety_hooks.py`
+- Modify: `docs/superpowers/specs/2026-07-27-agent-safety-hooks-design.md`
+- Modify: `docs/superpowers/plans/2026-07-27-agent-safety-hooks-plan.md`
 
 **Interfaces:**
 - Produces `SafetyResult` as a JSON-serializable mapping with `hook`, `event`, `action`, `reason_code`, `risk_level`, `message`, and sanitized `metadata`; `action` is one of `allow`, `warn`, `block`, `error`, or `skip`.
