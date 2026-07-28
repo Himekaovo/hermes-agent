@@ -381,7 +381,7 @@ def _check_security(event: str, payload: dict[str, Any], context: dict[str, Any]
 
 def run_safety_checks(
     event: str,
-    payload: dict[str, Any],
+    payload: Any,
     config: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     context: dict[str, Any] = {}
