@@ -728,6 +728,7 @@ def test_l1_filesystem_error_fails_open_and_collects_other_files(tmp_path):
 
 
 def test_l4_records_convert_to_items_with_read_time_reason():
+    from plugins.memory.mnemosyne.contracts import MnemosyneSourceRef
     from plugins.memory.mnemosyne.injector import collect_l4_items
 
     records = [{
@@ -748,3 +749,49 @@ def test_l4_records_convert_to_items_with_read_time_reason():
     assert items[0].score == 0.49
     assert items[0].reason_code == "l4_candidate_decay"
     assert "archive recommended" in items[0].reason
+    assert items[0].provenance == (
+        MnemosyneSourceRef(
+            layer="L2",
+            item_id="fact:1",
+            source="mnemosyne:l4",
+            reason_code="l4_source_ref",
+            reason_detail=(),
+        ),
+    )
+
+
+def test_l4_records_skip_malformed_source_refs_without_dropping_valid_refs():
+    from plugins.memory.mnemosyne.contracts import MnemosyneSourceRef
+    from plugins.memory.mnemosyne.injector import collect_l4_items
+
+    records = [{
+        "record_id": "l4_a",
+        "content": "Use rollback before retrying migrations.",
+        "confidence": 0.7,
+        "governance_state": "candidate",
+        "read_state": {"decay_score": 0.49, "archive_recommended": False},
+        "source_refs": [
+            {"layer": "L9", "item_id": "bad-layer"},
+            {"layer": "L2"},
+            "not a mapping",
+            {
+                "layer": "L2",
+                "item_id": "fact:1",
+                "source": "holographic",
+                "reason_code": "l2_query_tag_match",
+                "reason_detail": {"matched_tags": ["migration"]},
+            },
+        ],
+    }]
+
+    items = collect_l4_items(records)
+
+    assert items[0].provenance == (
+        MnemosyneSourceRef(
+            layer="L2",
+            item_id="fact:1",
+            source="holographic",
+            reason_code="l2_query_tag_match",
+            reason_detail=(("matched_tags", ("migration",)),),
+        ),
+    )

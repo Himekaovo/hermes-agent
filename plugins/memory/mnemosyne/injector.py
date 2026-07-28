@@ -5,12 +5,14 @@ from dataclasses import replace
 from datetime import datetime, timezone
 from math import floor
 from pathlib import Path
+from typing import Mapping
 
 from .contracts import (
     AUTHORITY_RANK,
     LAYERS,
     MnemosyneConfig,
     MnemosyneItem,
+    MnemosyneSourceRef,
 )
 
 
@@ -229,6 +231,35 @@ def collect_l1_items(
     return items, diagnostics
 
 
+def _l4_source_refs(record: Mapping[str, object]) -> tuple[MnemosyneSourceRef, ...]:
+    raw_refs = record.get("source_refs")
+    if not isinstance(raw_refs, list):
+        return ()
+
+    refs: list[MnemosyneSourceRef] = []
+    for raw_ref in raw_refs:
+        if not isinstance(raw_ref, Mapping):
+            continue
+        layer = raw_ref.get("layer")
+        item_id = raw_ref.get("item_id")
+        if not isinstance(layer, str) or not isinstance(item_id, str):
+            continue
+        reason_detail = raw_ref.get("reason_detail")
+        if not isinstance(reason_detail, Mapping):
+            reason_detail = {}
+        try:
+            refs.append(MnemosyneSourceRef(
+                layer=layer,
+                item_id=item_id,
+                source=str(raw_ref.get("source") or "mnemosyne:l4"),
+                reason_code=str(raw_ref.get("reason_code") or "l4_source_ref"),
+                reason_detail=tuple(reason_detail.items()),
+            ))
+        except (TypeError, ValueError):
+            continue
+    return tuple(refs)
+
+
 def collect_l4_items(l4_records: list[dict[str, object]]) -> list[MnemosyneItem]:
     items: list[MnemosyneItem] = []
     for record in l4_records:
@@ -252,7 +283,7 @@ def collect_l4_items(l4_records: list[dict[str, object]]) -> list[MnemosyneItem]
             ),
             score=score,
             source="mnemosyne:l4",
-            provenance=(),
+            provenance=_l4_source_refs(record),
             trust=float(record.get("confidence", 0.5)),
         ))
     return items
