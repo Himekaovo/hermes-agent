@@ -322,3 +322,16 @@ def test_run_safety_checks_preserves_earlier_results_when_later_checker_raises(m
         r["reason_code"] == "safety_check_error" and r["action"] == "error"
         for r in results
     )
+
+
+@pytest.mark.parametrize("payload", [None, "hello"])
+def test_run_safety_checks_returns_structured_error_for_malformed_payloads(payload):
+    from agent.safety_hooks import run_safety_checks
+
+    results = run_safety_checks("pre_llm_call", payload)  # type: ignore[arg-type]
+
+    assert len(results) == 1
+    assert results[0]["hook"] == "safety-hooks"
+    assert results[0]["action"] == "error"
+    assert results[0]["reason_code"] == "malformed_payload"
+    json.dumps(results)

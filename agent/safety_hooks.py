@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from pathlib import PurePath
 from typing import Any, Callable
 
@@ -216,6 +217,21 @@ def _execution_context_error_result(
     )
 
 
+def _malformed_payload_error_result(event: str, payload: Any) -> dict[str, Any]:
+    return make_result(
+        hook="safety-hooks",
+        event=event,
+        action="error",
+        reason_code="malformed_payload",
+        risk_level="unknown",
+        message="Safety checks require a mapping payload.",
+        metadata={
+            "payload_type": type(payload).__name__,
+            "payload_preview": _sanitize_value(payload),
+        },
+    )
+
+
 def _check_mode(event: str, payload: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
     planning_mode = bool(payload.get("planning_mode"))
     return make_result(
@@ -377,6 +393,9 @@ def run_safety_checks(
         _check_context_propagation,
     ]
     results: list[dict[str, Any]] = []
+    execution_context_error: dict[str, Any] | None = None
+    if not isinstance(payload, Mapping):
+        return [_malformed_payload_error_result(event, payload)]
     try:
         raw_context_payload = {
             "agent_id": payload.get("agent_id"),
@@ -392,7 +411,6 @@ def run_safety_checks(
             "requested_path": payload.get("requested_path"),
             "requested_paths": payload.get("requested_paths"),
         }
-        execution_context_error: dict[str, Any] | None = None
         try:
             context = normalize_execution_context(raw_context_payload)
         except ExecutionContextError as exc:
