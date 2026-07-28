@@ -13,7 +13,198 @@ from .contracts import (
     MnemosyneConfig,
     MnemosyneItem,
     MnemosyneSourceRef,
+    freeze_reason_detail,
 )
+
+_SKILL_INTENT_KEYWORDS = {
+    "api",
+    "install",
+    "lifecycle",
+    "provenance",
+    "skill",
+    "skills",
+    "tool",
+    "tools",
+    "workflow",
+    "安装",
+    "工具",
+    "技能",
+    "来源",
+    "能力",
+}
+_INACTIVE_SKILL_STATUSES = {"archived", "deprecated", "degraded", "disabled"}
+
+
+def _query_tokens(query: str) -> set[str]:
+    tokens: set[str] = set()
+    for token in (query or "").split():
+        normalized = token.strip(".,:;!?()[]{}<>\"'`").casefold()
+        if normalized:
+            tokens.add(normalized)
+    return tokens
+
+
+def _row_get(row: object, key: str, default: object = None) -> object:
+    if isinstance(row, Mapping):
+        return row.get(key, default)
+    return getattr(row, key, default)
+
+
+def is_skill_intent(
+    query: str,
+    known_skill_names: set[str] | None = None,
+) -> bool:
+    tokens = _query_tokens(query)
+    if not tokens:
+        return False
+    if tokens & _SKILL_INTENT_KEYWORDS:
+        return True
+    names = {name.casefold() for name in (known_skill_names or set()) if name}
+    return bool(tokens & names)
+
+
+def _l2_reason(row: object) -> tuple[str, tuple[tuple[str, object], ...]]:
+    reason_obj = _row_get(row, "reason")
+    if not isinstance(reason_obj, Mapping):
+        return "holographic recall", ()
+    detail = {
+        "strategy": reason_obj.get("strategy"),
+        "matched_terms": reason_obj.get("matched_terms", []),
+    }
+    return str(reason_obj.get("summary") or "holographic recall"), freeze_reason_detail(
+        {key: value for key, value in detail.items() if value not in (None, "")}
+    )
+
+
+def collect_l2_items(
+    retriever: object,
+    query: str,
+    *,
+    limit: int = 8,
+) -> tuple[list[MnemosyneItem], list[dict[str, object]]]:
+    if not query:
+        return [], []
+    try:
+        rows = retriever.search(
+            query,
+            min_trust=0.3,
+            limit=limit,
+            mark_retrieved=False,
+        )
+    except Exception as exc:
+        return [], [{
+            "reason": "l2_unavailable",
+            "layer": "L2",
+            "message": str(exc),
+        }]
+
+    items: list[MnemosyneItem] = []
+    for row in rows or []:
+        fact_id = _row_get(row, "fact_id")
+        reason, reason_detail = _l2_reason(row)
+        trust = _row_get(row, "trust_score", 0.5)
+        score = _row_get(row, "score", trust)
+        items.append(MnemosyneItem(
+            item_id=f"L2:fact:{fact_id}",
+            layer="L2",
+            content=str(_row_get(row, "content", "") or ""),
+            reason=reason,
+            reason_code="l2_retrieval_reason",
+            reason_detail=reason_detail,
+            score=float(score),
+            source="holographic",
+            provenance=(),
+            trust=float(trust),
+        ))
+    return items, []
+
+
+def _skill_rows(result: object) -> list[object]:
+    rows = _row_get(result, "items", [])
+    return list(rows) if isinstance(rows, list) else []
+
+
+def _skill_name(row: object) -> str:
+    return str(_row_get(row, "name", "") or _row_get(row, "skill_id", "") or "")
+
+
+def _is_visible_active_skill(row: object) -> bool:
+    status = str(_row_get(row, "status", "") or "").casefold()
+    if status in _INACTIVE_SKILL_STATUSES:
+        return False
+    visible = _row_get(row, "visible", True)
+    if visible is False:
+        return False
+    return True
+
+
+def _skill_matches_query(row: object, tokens: set[str]) -> bool:
+    name = _skill_name(row).casefold()
+    skill_id = str(_row_get(row, "skill_id", "") or "").casefold()
+    candidates = {name, skill_id}
+    candidates.update(part for part in name.replace("/", " ").replace(":", " ").split() if part)
+    candidates.update(part for part in skill_id.replace("/", " ").replace(":", " ").split() if part)
+    return bool(tokens & candidates)
+
+
+def collect_l3_items(
+    skillwiki: object,
+    query: str,
+    *,
+    known_skill_names: set[str] | None = None,
+) -> tuple[list[MnemosyneItem], list[dict[str, object]]]:
+    try:
+        result = skillwiki.list_skills()
+    except Exception as exc:
+        return [], [{
+            "reason": "l3_unavailable",
+            "layer": "L3",
+            "message": str(exc),
+        }]
+    if not bool(_row_get(result, "available", False)):
+        return [], [{
+            "reason": str(_row_get(result, "reason", "database_unavailable")),
+            "layer": "L3",
+        }]
+
+    rows = [row for row in _skill_rows(result) if _is_visible_active_skill(row)]
+    names = {_skill_name(row) for row in rows if _skill_name(row)}
+    if known_skill_names:
+        names.update(known_skill_names)
+    if not is_skill_intent(query, names):
+        return [], []
+
+    tokens = _query_tokens(query)
+    matched_rows = [row for row in rows if _skill_matches_query(row, tokens)]
+    if not matched_rows and tokens & _SKILL_INTENT_KEYWORDS:
+        matched_rows = rows
+
+    items: list[MnemosyneItem] = []
+    for row in matched_rows:
+        skill_id = str(_row_get(row, "skill_id", "") or _skill_name(row))
+        name = _skill_name(row)
+        status = str(_row_get(row, "status", "raw") or "raw")
+        has_complete_provenance = bool(
+            _row_get(row, "content_hash") and _row_get(row, "source_url")
+        )
+        confidence = 1.0 if has_complete_provenance else 0.5
+        items.append(MnemosyneItem(
+            item_id=f"L3:{skill_id}",
+            layer="L3",
+            content=f"skill {name} is {status}",
+            reason=f"deterministic skill intent matched {name}; SkillWiki status {status}",
+            reason_code="l3_skill_intent_match",
+            reason_detail=(
+                ("skill", name),
+                ("status", status),
+                ("provenance_complete", has_complete_provenance),
+            ),
+            score=confidence,
+            source="skillwiki",
+            provenance=(),
+            trust=confidence,
+        ))
+    return items, []
 
 
 def freshness_score(created_at: datetime | None) -> float:
