@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import FrozenInstanceError
 from datetime import datetime, timezone
 import json
+import multiprocessing
+import os
 
 import pytest
 
@@ -119,6 +121,36 @@ def _l4_record(**overrides):
     }
     base.update(overrides)
     return base
+
+
+def _write_l4_candidate_after_read_barrier(
+    hermes_home: str,
+    content: str,
+    read_entered,
+    allow_write,
+    result_queue,
+) -> None:
+    """Run a deliberately stale read in a separate process for lock coverage."""
+    from plugins.memory.mnemosyne.contracts import MnemosyneConfig
+    from plugins.memory.mnemosyne.l4_store import L4CandidateRecord, L4Store
+
+    store = L4Store(hermes_home, profile_id="coder", config=MnemosyneConfig.from_mapping({}))
+    original_read = L4Store._read_raw_lines
+
+    def read_after_barrier(self, *args, **kwargs):
+        raw_lines = original_read(self, *args, **kwargs)
+        read_entered.set()
+        if not allow_write.wait(timeout=10):
+            raise RuntimeError("timed out waiting to finish stale L4 write")
+        return raw_lines
+
+    L4Store._read_raw_lines = read_after_barrier
+    try:
+        result_queue.put(("ok", store.write_candidate(L4CandidateRecord.from_mapping(
+            _l4_record(content=content)
+        ))))
+    except Exception as exc:
+        result_queue.put(("error", repr(exc)))
 
 
 def test_l4_write_preserves_malformed_lines_and_is_idempotent(tmp_path):
@@ -389,3 +421,120 @@ def test_l4_parent_session_id_type_and_none_id_are_distinct_from_empty():
     assert none_parent.record_id != empty_parent.record_id
     with pytest.raises((TypeError, ValueError)):
         L4CandidateRecord.from_mapping(_l4_record(parent_session_id=42))
+
+
+def test_l4_write_rejects_existing_valid_record_from_another_profile(tmp_path):
+    from plugins.memory.mnemosyne.contracts import MnemosyneConfig
+    from plugins.memory.mnemosyne.l4_store import L4CandidateRecord, L4Store, SecurityInvariantError
+
+    l4_path = tmp_path / "memories" / "mnemosyne" / "l4.jsonl"
+    l4_path.parent.mkdir(parents=True)
+    existing = L4CandidateRecord.from_mapping(_l4_record(profile_id="other-profile"))
+    l4_path.write_text(json.dumps(existing.payload) + "\n", encoding="utf-8")
+    store = L4Store(tmp_path, profile_id="coder", config=MnemosyneConfig.from_mapping({}))
+
+    with pytest.raises(SecurityInvariantError, match="profile_id"):
+        store.write_candidate(L4CandidateRecord.from_mapping(_l4_record(content="coder lesson")))
+
+    persisted = [json.loads(line) for line in l4_path.read_text(encoding="utf-8").splitlines()]
+    assert persisted == [existing.payload]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX multiprocessing locks")
+def test_l4_interprocess_writes_preserve_both_candidates(tmp_path):
+    from plugins.memory.mnemosyne.contracts import MnemosyneConfig
+    from plugins.memory.mnemosyne.l4_store import L4Store
+
+    context = multiprocessing.get_context("fork")
+    first_read = context.Event()
+    second_read = context.Event()
+    allow_first_write = context.Event()
+    allow_second_write = context.Event()
+    results = context.Queue()
+    first = context.Process(
+        target=_write_l4_candidate_after_read_barrier,
+        args=(
+            str(tmp_path),
+            "first process lesson",
+            first_read,
+            allow_first_write,
+            results,
+        ),
+    )
+    second = context.Process(
+        target=_write_l4_candidate_after_read_barrier,
+        args=(
+            str(tmp_path),
+            "second process lesson",
+            second_read,
+            allow_second_write,
+            results,
+        ),
+    )
+
+    first.start()
+    assert first_read.wait(timeout=5)
+    second.start()
+    second_read.wait(timeout=1)
+    allow_first_write.set()
+    first.join(timeout=10)
+    assert first.exitcode == 0
+    allow_second_write.set()
+    second.join(timeout=10)
+    assert second.exitcode == 0
+
+    outcomes = [results.get(timeout=2), results.get(timeout=2)]
+    assert all(status == "ok" and result["written"] is True for status, result in outcomes)
+    store = L4Store(tmp_path, profile_id="coder", config=MnemosyneConfig.from_mapping({}))
+    records, diagnostics = store.read_records()
+    assert diagnostics == []
+    assert {record["content"] for record in records} == {
+        "first process lesson",
+        "second process lesson",
+    }
+
+
+def test_l4_rewrite_uses_trusted_directory_fds(monkeypatch, tmp_path):
+    from plugins.memory.mnemosyne.contracts import MnemosyneConfig
+    from plugins.memory.mnemosyne.l4_store import L4CandidateRecord, L4Store
+
+    if os.name != "posix" or not hasattr(os, "O_DIRECTORY") or not hasattr(os, "O_NOFOLLOW"):
+        pytest.skip("platform lacks trusted directory descriptor primitives")
+    if os.open not in os.supports_dir_fd or os.rename not in os.supports_dir_fd:
+        pytest.skip("platform lacks dir_fd rewrite support")
+
+    open_calls = []
+    replace_calls = []
+    original_open = os.open
+    original_replace = os.replace
+
+    def tracking_open(path, flags, mode=0o777, *, dir_fd=None):
+        open_calls.append((path, flags, dir_fd))
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    def tracking_replace(source, destination, *, src_dir_fd=None, dst_dir_fd=None):
+        replace_calls.append((source, destination, src_dir_fd, dst_dir_fd))
+        return original_replace(
+            source,
+            destination,
+            src_dir_fd=src_dir_fd,
+            dst_dir_fd=dst_dir_fd,
+        )
+
+    monkeypatch.setattr(os, "open", tracking_open)
+    monkeypatch.setattr(os, "replace", tracking_replace)
+    store = L4Store(tmp_path, profile_id="coder", config=MnemosyneConfig.from_mapping({}))
+
+    assert store.write_candidate(L4CandidateRecord.from_mapping(_l4_record()))["written"] is True
+    assert any(
+        isinstance(path, str) and path.startswith(".l4-") and dir_fd is not None
+        for path, _flags, dir_fd in open_calls
+    )
+    assert any(
+        isinstance(source, str)
+        and source.startswith(".l4-")
+        and destination == "l4.jsonl"
+        and src_dir_fd is not None
+        and dst_dir_fd is not None
+        for source, destination, src_dir_fd, dst_dir_fd in replace_calls
+    )
