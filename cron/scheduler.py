@@ -49,20 +49,50 @@ from agent.shell_hooks import build_instance_hooks
 logger = logging.getLogger(__name__)
 
 
-def _resolve_cron_hook_overrides(job: dict, cfg: dict) -> dict:
-    """Build callbacks declared by one Cron job without global registration."""
-    hooks = job.get("hooks") if isinstance(job, dict) else None
-    if not isinstance(hooks, dict) or not hooks:
+def _fresh_cron_context() -> contextvars.Context:
+    """Cron jobs run in a clean ContextVar scope, not the caller's."""
+    return contextvars.Context()
+
+
+def _clone_hook_overrides(overrides: dict | None) -> dict:
+    if not isinstance(overrides, dict):
         return {}
+    return {
+        str(name): list(callbacks)
+        for name, callbacks in overrides.items()
+        if isinstance(callbacks, (list, tuple)) and callbacks
+    }
+
+
+def _merge_hook_overrides(*sources: dict | None) -> dict:
+    merged: dict[str, list[Any]] = {}
+    for source in sources:
+        cloned = _clone_hook_overrides(source)
+        for name, callbacks in cloned.items():
+            merged.setdefault(name, []).extend(callbacks)
+    return merged
+
+
+def _resolve_cron_hook_overrides(job: dict, cfg: dict) -> dict:
+    """Build job-local safety and explicit callbacks without global registration."""
+    from agent.safety_hooks import build_safety_hook_overrides
+
+    hooks = job.get("hooks") if isinstance(job, dict) else None
+    explicit_overrides = {}
+    safety_overrides = _fresh_cron_context().run(build_safety_hook_overrides)
+    if not isinstance(hooks, dict) or not hooks:
+        return _merge_hook_overrides(safety_overrides)
     instance_cfg = {
         "hooks": hooks,
         "hooks_auto_accept": bool((cfg or {}).get("hooks_auto_accept")),
     }
     try:
-        return build_instance_hooks(instance_cfg)
+        explicit_overrides = _fresh_cron_context().run(
+            lambda: build_instance_hooks(instance_cfg, accept_hooks=True)
+        )
     except Exception:
         logger.warning("Failed to build Cron job hook overrides", exc_info=True)
-        return {}
+    return _merge_hook_overrides(safety_overrides, explicit_overrides)
 
 
 def _set_cron_session_title(session_db, session_id, base_title):
@@ -3354,6 +3384,8 @@ def run_job(
                 job_id, _mcp_exc,
             )
 
+        _job_hook_overrides = _resolve_cron_hook_overrides(job, _cfg)
+
         agent = AIAgent(
             model=model,
             api_key=runtime.get("api_key"),
@@ -3385,8 +3417,9 @@ def run_job(
             platform="cron",
             session_id=_cron_session_id,
             session_db=_session_db,
-            hook_overrides=_resolve_cron_hook_overrides(job, _cfg),
+            hook_overrides=_job_hook_overrides,
         )
+        agent.hook_overrides = _clone_hook_overrides(_job_hook_overrides)
         
         # Run the agent with an *inactivity*-based timeout: the job can run
         # for hours if it's actively calling tools / receiving stream tokens,
@@ -3443,10 +3476,10 @@ def run_job(
                 )
 
         _cron_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-        # Preserve scheduler-scoped ContextVar state (for example skill-declared
-        # env passthrough registrations) when the cron run hops into the worker
-        # thread used for inactivity timeout monitoring.
-        _cron_context = contextvars.copy_context()
+        # Run the conversation inside a fresh ContextVar scope so cron jobs do
+        # not inherit an interactive caller's per-turn hook/session state when
+        # they hop into the worker thread used for inactivity monitoring.
+        _cron_context = _fresh_cron_context()
         _cron_future = _cron_pool.submit(_cron_context.run, agent.run_conversation, prompt)
         _inactivity_timeout = False
         try:
@@ -4040,7 +4073,7 @@ def tick(
             # abandoned records as unknown; it never automatically retries them.
             execution = create_execution(job_id, source="builtin")
             dispatched_job = dict(job, execution_id=execution["id"])
-            _ctx = contextvars.copy_context()
+            _ctx = _fresh_cron_context()
 
             def _run_and_release(j=dispatched_job, ctx=_ctx):
                 try:

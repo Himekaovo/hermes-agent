@@ -33,6 +33,40 @@ def _clone_hook_overrides(overrides: "Optional[Dict[str, List[Any]]]") -> dict:
         for name, callbacks in overrides.items()
         if isinstance(callbacks, (list, tuple)) and callbacks
     }
+
+
+_SAFETY_HOOK_NAMES = frozenset({"_pre_llm_call", "_post_llm_call", "_on_session_end"})
+
+
+def _is_safety_hook_callback(callback) -> bool:
+    return (
+        callable(callback)
+        and getattr(callback, "__module__", "") == "agent.safety_hooks"
+        and getattr(callback, "__name__", "") in _SAFETY_HOOK_NAMES
+    )
+
+
+def _build_child_hook_overrides(
+    overrides: "Optional[Dict[str, List[Any]]]",
+) -> dict:
+    """Return fresh child safety hooks plus copied explicit parent callbacks."""
+    from agent.safety_hooks import build_safety_hook_overrides
+
+    explicit_overrides = _clone_hook_overrides(overrides)
+    for name, callbacks in list(explicit_overrides.items()):
+        kept = [callback for callback in callbacks if not _is_safety_hook_callback(callback)]
+        if kept:
+            explicit_overrides[name] = kept
+        else:
+            explicit_overrides.pop(name, None)
+
+    merged: Dict[str, List[Any]] = {}
+    for source in (build_safety_hook_overrides(), explicit_overrides):
+        for name, callbacks in source.items():
+            if not isinstance(callbacks, (list, tuple)) or not callbacks:
+                continue
+            merged.setdefault(str(name), []).extend(list(callbacks))
+    return merged
 import os
 import threading
 import time
@@ -1450,6 +1484,10 @@ def _build_child_agent(
     if isinstance(child_max_tokens, int):
         child_optional_kwargs["max_tokens"] = child_max_tokens
 
+    child_hook_overrides = _build_child_hook_overrides(
+        getattr(parent_agent, "hook_overrides", None)
+    )
+
     child = AIAgent(
         base_url=effective_base_url,
         api_key=effective_api_key,
@@ -1475,9 +1513,7 @@ def _build_child_agent(
         thinking_callback=child_thinking_cb,
         session_db=getattr(parent_agent, "_session_db", None),
         parent_session_id=getattr(parent_agent, "session_id", None),
-        hook_overrides=_clone_hook_overrides(
-            getattr(parent_agent, "hook_overrides", None)
-        ),
+        hook_overrides=child_hook_overrides,
         providers_allowed=child_providers_allowed,
         providers_ignored=child_providers_ignored,
         providers_order=child_providers_order,
@@ -1494,6 +1530,7 @@ def _build_child_agent(
         iteration_budget=None,  # fresh budget per subagent
         **child_optional_kwargs,
     )
+    child.hook_overrides = _clone_hook_overrides(child_hook_overrides)
     child._print_fn = getattr(parent_agent, "_print_fn", None)
     # Now the child exists, its session id can ride on every relayed event
     # (including the spawn_requested below — first emit happens after this).
