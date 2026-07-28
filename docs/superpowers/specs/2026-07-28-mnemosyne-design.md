@@ -27,7 +27,8 @@ This phase does not:
 
 - rewrite the Agent main loop;
 - create a parallel full replacement for existing memory providers;
-- bypass Memory Governance to mutate `MEMORY.md`, `USER.md`, or L2 facts;
+- bypass Memory Governance to mutate `MEMORY.md` or `USER.md`;
+- bypass the holographic fact-store owner to mutate L2 facts;
 - automatically modify L1 Core memory;
 - automatically promote or merge memories across layers;
 - delete, rewrite, archive, or roll back memory automatically;
@@ -172,6 +173,10 @@ Rules:
 - Health warnings must not become install, upgrade, or lifecycle actions.
 - Mnemosyne never changes SkillWiki lifecycle state.
 
+L3 intent routing is deterministic in v1. It may use configured keywords, known
+tool/skill names, query tokens, and existing deterministic intent helpers. It
+must not call a model to decide whether Skill/API context should be included.
+
 ### L4 Reflection/Experience
 
 L4 is the only new local storage in this phase. It is a reflection and experience
@@ -187,7 +192,7 @@ Each valid record uses this contract:
 
 ```python
 {
-    "record_id": "l4_<sha_or_uuid>",
+    "record_id": "l4_<sha256_24>",
     "kind": "reflection" | "strategy" | "success_pattern" |
             "failure_pattern" | "lesson" | "conflict",
     "content": "...",
@@ -195,7 +200,6 @@ Each valid record uses this contract:
     "session_id": "...",
     "agent_id": "...",
     "execution_kind": "interactive" | "cron" | "subagent" | "flush",
-    "status": "candidate" | "approved" | "rejected" | "archived",
     "confidence": 0.0,
     "decay_score": 1.0,
     "governance_state": "candidate" | "approved" | "rejected" | "archived",
@@ -206,28 +210,46 @@ Each valid record uses this contract:
 }
 ```
 
+`governance_state` is the single state field. The first implementation must not
+also store `status`, `record_state`, or any second lifecycle axis. This avoids
+illegal split-brain combinations such as an approved record whose governance
+state is still candidate.
+
 `on_session_end()` may write L4 candidates through the controlled Mnemosyne L4
 candidate API. That is the only new persistence path in this phase. L4 candidate
 writes must be profile-scoped, JSON-serializable, bounded, locked, atomic, and
 fail-open. They must not imply approval, Core persistence, or L2 fact creation.
 
-Any migration from L4 to L1 or L2 remains a future explicit action and must pass
-Memory Governance.
+Any migration from L4 to L1 or L2 remains a future explicit action. L4-to-L1
+must pass existing Memory Governance. L4-to-L2 must pass a separately approved
+holographic fact-store governance/write gate that does not exist in this phase.
 
 ## 6. Data contracts
 
-All layer recall is normalized into immutable `MnemosyneItem` values:
+All layer recall is normalized into immutable `MnemosyneItem` values. Deep
+immutability matters: neither the Injector nor cross-layer merging may mutate a
+source item in place.
 
 ```python
+@dataclass(frozen=True)
+class MnemosyneSourceRef:
+    layer: Literal["L1", "L2", "L3", "L4"]
+    item_id: str
+    source: str
+    reason_code: str
+    reason_detail: tuple[tuple[str, object], ...] = ()
+
 @dataclass(frozen=True)
 class MnemosyneItem:
     item_id: str
     layer: Literal["L1", "L2", "L3", "L4"]
     content: str
     reason: str
+    reason_code: str
+    reason_detail: tuple[tuple[str, object], ...]
     score: float
     source: str
-    provenance: dict[str, object]
+    provenance: tuple[MnemosyneSourceRef, ...]
     trust: float | None = None
     created_at: datetime | None = None
     expires_at: datetime | None = None
@@ -235,6 +257,22 @@ class MnemosyneItem:
 
 `reason` is mandatory. It must come from the layer's actual retrieval or
 selection signal, not from a later Injector guess.
+
+Construction normalizes mutable input recursively into tuples or frozen
+dataclasses. If a layer produces a dict-like provenance object, the adapter must
+copy and freeze it before creating `MnemosyneItem`. Cross-layer deduplication
+creates a new aggregate item with merged provenance; it must not modify either
+original item.
+
+`reason_detail` values are limited to JSON primitives and tuples of JSON
+primitives after normalization. Lists, dicts, sets, and mutable objects are not
+stored in the final item.
+
+Reason text is a sanitized rendering of structured reason data. It must not copy
+raw SQL, absolute local paths, environment variables, credentials, tokens, or
+unredacted SkillWiki diagnostic payloads. Each layer should provide a stable
+`reason_code`, such as `l2_query_tag_match`, with safe details such as matched
+tags or lifecycle state.
 
 The provider returns a bounded context block formatted for the existing
 `MemoryManager.prefetch_all()` pipeline. The block should include compact layer
@@ -275,17 +313,28 @@ execution kind to choose budgets and layers.
 ### `sync_turn(user_content, assistant_content, messages=None)`
 
 Call the Observer to create ephemeral observations. The default implementation
-does not write L1/L2/L3. It may queue bounded L4 candidate observations only if
-configured and only through the L4 candidate API.
+does not write L1/L2/L3. It may add bounded candidate observations to an
+instance-local in-memory buffer only if configured. `sync_turn()` must not write
+`l4.jsonl` directly.
+
+The in-memory buffer is best-effort. Provider shutdown or process crash may lose
+buffered observations in this phase. Cron and Subagent contexts may buffer
+candidates only when explicitly allowed by trusted config; the default is
+interactive primary-agent buffering only.
 
 ### `on_session_end(messages)`
 
-Call the Refiner. It may write L4 candidates. It must not write L1/L2 facts or
-promote L4. It must never block cleanup.
+Call the Refiner. It may filter the instance-local candidate buffer and write L4
+candidates through the controlled L4 candidate API. It must not write L1/L2
+facts, promote L4, or persist Subagent candidates as primary-session Core. It
+must never block cleanup.
 
 ### `on_memory_write(action, target, content, metadata=None)`
 
 Observe successful built-in memory writes and optionally create L4 source refs.
+This hook is called only after the lower-level write has confirmed success. It
+uses the same idempotency key as L4 candidates when creating source references,
+so a duplicated memory-write notification does not create duplicate L4 records.
 This hook must not mirror writes back into L1 or L2.
 
 ### Tools
@@ -337,11 +386,76 @@ Mnemosyne cannot bypass these authorities. In particular:
   separately approved fact-store governance path.
 - L3 lifecycle remains explicit SkillWiki state transition only.
 - L4 writes create candidates, not approved facts.
-- L4-to-L1/L2 promotion is out of scope and must be explicitly approved later.
+- L4-to-L1 promotion is out of scope and must later pass Memory Governance.
+- L4-to-L2 promotion is out of scope and must later pass a separately approved
+  holographic fact-store write gate.
 
 Malformed L4 JSONL records are ignored for reads and preserved during writes.
 L4 writes use a profile-scoped lock, same-directory temporary file, flush, fsync,
 and atomic replacement.
+
+### L4 candidate write algorithm
+
+L4 candidate writes use a lock-protected rewrite, not append-only writes:
+
+1. Resolve `memories/mnemosyne/l4.jsonl` from trusted profile state.
+2. Acquire the profile-scoped exclusive L4 lock.
+3. Read the existing file as raw line bytes; if the file is missing, start from
+   an empty line sequence.
+4. Preserve every original line byte-for-byte, including malformed JSON lines.
+5. Parse valid JSON object lines into records for lookup only; malformed lines
+   are not returned as L4 items.
+6. Compute the candidate's stable `record_id`.
+7. If that `record_id` already exists in a valid record, no-op and keep the file
+   unchanged.
+8. Reject the candidate, fail open, and keep the file unchanged if the serialized
+   record exceeds `max_record_chars`, includes embedded newlines, or the final
+   file would exceed `max_l4_file_chars`.
+9. Serialize the new record as one canonical single-line JSON object.
+10. Write preserved original lines plus the new line to a same-directory
+    temporary file.
+11. Flush and `fsync` the temporary file.
+12. Replace the target with `os.replace`.
+13. `fsync` the parent directory on platforms that support it.
+14. Release the lock.
+
+Default L4 write limits:
+
+```yaml
+mnemosyne:
+  max_l4_file_chars: 1048576
+  max_l4_record_chars: 4096
+```
+
+These limits apply to Python characters for validation and UTF-8 bytes for the
+actual on-disk write. If either check fails, the candidate is skipped.
+
+### L4 idempotency
+
+Session-end and memory-write observation can run more than once. L4 candidates
+therefore use a deterministic key:
+
+```text
+candidate_key =
+  profile_id + "\0" +
+  session_id + "\0" +
+  agent_id + "\0" +
+  execution_kind + "\0" +
+  kind + "\0" +
+  normalized_content + "\0" +
+  canonical_normalized_source_refs
+```
+
+`record_id` is:
+
+```python
+record_id = "l4_" + sha256(candidate_key.encode("utf-8")).hexdigest()[:24]
+```
+
+If the same `record_id` already exists, the write is a no-op. If the same
+content appears with different normalized source refs, v1 treats it as a
+different candidate because the evidence trail changed. It does not merge or
+version existing records.
 
 ## 10. Profile, Agent, Cron, and Subagent isolation
 
@@ -378,10 +492,77 @@ raise into the Agent main loop.
 Persistence failures for L4 candidates are reported as diagnostics and fail
 open. They do not block cleanup, response delivery, or other memory providers.
 
+Fail-open applies to availability failures, not security invariant failures.
+
+Availability failures include:
+
+- missing files;
+- unavailable SkillWiki database;
+- transient SQLite errors;
+- malformed L4 lines;
+- layer timeouts.
+
+Security invariant failures include:
+
+- `HERMES_HOME` or a resolved memory path is outside the trusted profile root;
+- symlink resolution escapes the trusted profile root;
+- profile identity in a record does not match the active profile;
+- config tries to set an unapproved local path;
+- L4 parsing finds records for another profile in the active profile file;
+- bridge configuration contains a URL, credential, or remote implementation in
+  this local-only phase.
+
+On security invariant failure, Mnemosyne disables itself for the current provider
+lifecycle, returns empty context, and performs no reads or writes against the
+disputed resource. The Agent main loop still continues. In short:
+
+```text
+Agent fail-open
+!=
+Mnemosyne security check fail-open
+```
+
+Path checks use resolved real paths, not string prefix checks. The resolved file
+must remain under the resolved trusted profile root.
+
 ## 12. Injection budgeting and ranking
 
 `prefetch()` uses a total character budget and per-layer caps. Budgets are
 configurable but bounded.
+
+V1 defaults:
+
+```yaml
+mnemosyne:
+  total_char_budget: 6000
+  max_total_char_budget: 12000
+  max_items_per_layer: 8
+  max_item_chars: 1000
+  layer_budgets:
+    L1: 1200
+    L2: 3200
+    L3: 800
+    L4: 800
+  cron_multiplier: 0.5
+  subagent_multiplier: 0.5
+```
+
+Budgets count Python characters, including section titles, bullets, reason text,
+and separators. Before writing to the prompt block, the final UTF-8 bytes are
+also checked against the same numeric limit multiplied by 4 as a defensive
+upper bound for multi-byte text. Configured values above hard limits are
+clamped, not accepted as-is.
+
+Truncation is deterministic:
+
+1. Adapter outputs are first clipped to `max_item_chars` per item, preserving the
+   beginning of `content` and a complete sanitized `reason`.
+2. Items are sorted with the final tuple sort below.
+3. Items are appended while both the layer budget and total budget permit.
+4. If an item does not fit after clipping, it is skipped rather than partially
+   emitting malformed context.
+5. If a layer has unused budget, that budget may be borrowed by L2, then L1,
+   then L4, then L3, in that order, without exceeding `total_char_budget`.
 
 Default ranking:
 
@@ -406,18 +587,55 @@ Deduplication:
 Sorting combines normalized layer priority, layer score, trust, freshness,
 confidence, and query overlap. Scores are always clamped to `[0.0, 1.0]`.
 
+V1 uses a deterministic tuple sort:
+
+```python
+sort_key = (
+    -authority_rank[item.layer],
+    -item.score,
+    -(item.trust if item.trust is not None else 0.5),
+    -freshness_score(item.created_at),
+    item.item_id,
+)
+```
+
+`authority_rank` is:
+
+```python
+{"L1": 4, "L2": 3, "L3": 2, "L4": 1}
+```
+
+Layer-specific retrieval functions may compute their own score, but the final
+merge must use the stable tuple above. `item_id` is the final tie-breaker so
+identical inputs produce identical ordering.
+
 ## 13. L4 decay and archive suggestions
 
-Decay is computed dynamically at read time. The default review threshold is 90
-days.
+Decay is computed dynamically at read time using UTC timestamps. The default
+review threshold is 90 days.
 
 Rules:
 
-- `decay_score` may decrease with age and lack of validation.
+- `decay_score` decreases deterministically with age.
 - `archive_recommended=True` may be returned for stale L4 records.
-- Querying or prefetching must not change `status`, `archived_at`, or
+- Querying or prefetching must not change `governance_state`, `archived_at`, or
   `last_validated_at`.
 - Automatic archive is out of scope.
+
+V1 decay:
+
+```python
+reference_time = last_validated_at or created_at
+age_days = max(0, floor((now_utc - reference_time).total_seconds() / 86400))
+decay_score = max(0.0, 1.0 - age_days / 180.0)
+archive_recommended = age_days >= 90
+```
+
+Invalid timestamps make the record unavailable for injection and add a
+diagnostic warning; they do not rewrite the record. Future timestamps are
+clamped to `age_days = 0`. `candidate` and `approved` records use the same
+formula in v1; `rejected` and `archived` records are excluded from normal
+injection.
 
 The system may later add explicit CLI commands to approve, reject, archive, or
 validate L4 records. That is not part of the first implementation unless a
@@ -471,13 +689,34 @@ Focused tests:
 - L3 includes only visible, non-disabled skills and never changes lifecycle.
 - L4 candidate writes are profile-scoped, locked, atomic, bounded, and
   malformed-line preserving.
+- L4 candidate writes preserve malformed lines byte-for-byte while adding valid
+  records through lock-protected atomic rewrite.
+- Repeated `on_session_end(messages)` calls produce one L4 record for the same
+  candidate key.
 - `on_session_end()` can write L4 candidates but cannot write L1/L2.
 - `sync_turn()` observations are not automatically Core memory.
+- `sync_turn()` only updates the instance-local buffer and does not touch
+  `l4.jsonl`.
+- Duplicate `on_memory_write()` notifications do not create duplicate L4 source
+  records.
 - Cron and Subagent budgets differ from interactive budgets.
 - Subagent context omits full sensitive L1 by default.
 - Duplicate cross-layer items merge provenance and reasons.
+- Cross-layer merging creates a new item and leaves source `MnemosyneItem`
+  provenance immutable.
+- Security invariant failures disable the provider lifecycle and do not read or
+  write disputed paths.
+- Symlink escape under `memories/mnemosyne/` is rejected by resolved-path checks.
+- Default budgets, per-item caps, skip-on-overflow truncation, and stable
+  `item_id` tie-break sorting are deterministic.
 - L4 age over 90 days returns `archive_recommended=True` without changing
-  status or `archived_at`.
+  `governance_state` or `archived_at`.
+- L4 future timestamps are clamped to `age_days = 0`; invalid timestamps are not
+  injected.
+- L3 Skill/API intent routing uses deterministic keywords/tool names only and
+  never calls a model.
+- Reason output contains a stable `reason_code` and never includes raw SQL,
+  absolute paths, env vars, credentials, or unredacted diagnostics.
 - Bridge protocol exists but default provider performs zero network access.
 
 Relevant regression tests:
