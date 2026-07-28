@@ -9,6 +9,7 @@ from typing import Any, Callable
 
 ALLOWED_ACTIONS = frozenset({"allow", "warn", "block", "error", "skip"})
 ALLOWED_RISK_LEVELS = frozenset({"low", "medium", "high", "critical", "unknown"})
+ALLOWED_EXECUTION_KINDS = frozenset({"interactive", "cron", "subagent"})
 _MAX_TEXT_CHARS = 200
 _MAX_LIST_ITEMS = 20
 _MAX_DICT_ITEMS = 20
@@ -120,20 +121,27 @@ def make_result(
 def normalize_execution_context(payload: dict[str, Any]) -> dict[str, Any]:
     missing_fields = [
         field
-        for field in ("agent_id", "execution_kind", "session_id")
+        for field in ("agent_id", "execution_kind", "session_id", "task_id", "turn_id")
         if not bounded_context(payload.get(field), max_chars=120).strip()
     ]
+    execution_kind = bounded_context(payload.get("execution_kind"), max_chars=120).strip()
+    if execution_kind and execution_kind not in ALLOWED_EXECUTION_KINDS:
+        missing_fields.append(f"execution_kind:{execution_kind}")
     if missing_fields:
         raise ExecutionContextError(missing_fields)
     context: dict[str, Any] = {
         "agent_id": bounded_context(payload["agent_id"], max_chars=120),
-        "execution_kind": bounded_context(payload["execution_kind"], max_chars=120),
+        "execution_kind": execution_kind,
         "session_id": bounded_context(payload["session_id"], max_chars=120),
+        "task_id": bounded_context(payload["task_id"], max_chars=120),
+        "turn_id": bounded_context(payload["turn_id"], max_chars=120),
+        "parent_session_id": (
+            None
+            if payload.get("parent_session_id") is None
+            else _sanitize_value(payload.get("parent_session_id"))
+        ),
     }
     for optional in (
-        "parent_session_id",
-        "task_id",
-        "turn_id",
         "user_message",
         "planning_mode",
         "subagent_id",
@@ -186,6 +194,7 @@ def _execution_context_error_result(
         metadata={
             "missing_fields": missing_fields,
             "session_id": payload.get("session_id", ""),
+            "execution_kind": payload.get("execution_kind", ""),
         },
     )
 
@@ -231,6 +240,16 @@ def _check_local_recall(event: str, payload: dict[str, Any], context: dict[str, 
 
 
 def _check_context_propagation(event: str, payload: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
+    if not context:
+        return make_result(
+            hook="context-propagation",
+            event=event,
+            action="skip",
+            reason_code="context_unavailable",
+            risk_level="unknown",
+            message="Structured task context unavailable.",
+            metadata={},
+        )
     task_id = bounded_context(payload.get("task_id"), max_chars=120).strip()
     turn_id = bounded_context(payload.get("turn_id"), max_chars=120).strip()
     missing: list[str] = []
