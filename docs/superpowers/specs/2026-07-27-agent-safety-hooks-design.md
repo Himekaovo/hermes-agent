@@ -181,6 +181,8 @@ Hook 抛异常、超时、畸形输入或无法判断 → ERROR，然后按该�
 
 执行环境只能由这些可信字段决定，不能从 prompt 文本推断。Cron 不继承交互会话临时 context；Subagent 只继承显式复制的 callback 和显式允许的 context；不同 Agent 的 Hook 状态、缓存、审计和失败记录不能共享可变全局对象。
 
+`agent_id`、`execution_kind`、`session_id`、`task_id` 和 `turn_id` 是严格必填字段；`execution_kind` 只能是 `interactive`、`cron` 或 `subagent`；根 Agent 的 `parent_session_id` 必须显式归一化为 `None`。缺少或格式非法的字段返回 `ERROR`，不能降级为普通 warning。
+
 阶段顺序与行为：
 
 - `pre_llm_call` 固定顺序为 `identity → mode → delegation/context → recall → security`，其中 `BLOCK` 阻止当前模型调用；

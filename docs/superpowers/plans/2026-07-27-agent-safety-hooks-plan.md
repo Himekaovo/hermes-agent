@@ -34,7 +34,7 @@
 
 **Interfaces:**
 - Produces `SafetyResult` as a JSON-serializable mapping with `hook`, `event`, `action`, `reason_code`, `risk_level`, `message`, and sanitized `metadata`; `action` is one of `allow`, `warn`, `block`, `error`, or `skip`.
-- Produces `normalize_execution_context(payload) -> dict[str, Any]` and rejects missing `agent_id`, `execution_kind`, or `session_id` as an `ERROR` result.
+- Produces `normalize_execution_context(payload) -> dict[str, Any]` and rejects missing `agent_id`, `execution_kind`, `session_id`, `task_id`, or `turn_id`, plus invalid execution kinds, as an `ERROR` result; root `parent_session_id` normalizes to `None`.
 - Produces `run_safety_checks(event, payload, config=None) -> list[dict[str, Any]]`.
 - Produces `build_safety_hook_overrides(config=None, memory_provider=None) -> dict[str, list[Callable[..., Any]]]` for later Tasks 2-4.
 
