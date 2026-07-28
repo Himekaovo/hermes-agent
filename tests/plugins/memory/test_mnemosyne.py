@@ -683,3 +683,54 @@ def test_merge_duplicate_items_with_empty_provenance_returns_new_item():
     assert merged[0] is not first
     assert merged[0] is not second
     assert merged[0].provenance == ()
+
+
+def test_l1_missing_files_fail_open(tmp_path):
+    from plugins.memory.mnemosyne.injector import collect_l1_items
+
+    items, diagnostics = collect_l1_items(tmp_path, include_sensitive=True, query="anything")
+
+    assert items == []
+    assert diagnostics == []
+
+
+def test_l1_query_path_like_text_cannot_change_profile_paths(tmp_path):
+    from plugins.memory.mnemosyne.injector import collect_l1_items
+
+    memory_dir = tmp_path / "memories"
+    memory_dir.mkdir()
+    (memory_dir / "USER.md").write_text("prefers Chinese summaries", encoding="utf-8")
+
+    items, diagnostics = collect_l1_items(
+        tmp_path,
+        include_sensitive=True,
+        query="../../other/USER.md",
+    )
+
+    assert diagnostics == []
+    assert len(items) == 1
+    assert items[0].source.endswith("USER.md")
+    assert "prefers Chinese summaries" in items[0].content
+
+
+def test_l4_records_convert_to_items_with_read_time_reason():
+    from plugins.memory.mnemosyne.injector import collect_l4_items
+
+    records = [{
+        "record_id": "l4_a",
+        "kind": "lesson",
+        "content": "Use rollback before retrying migrations.",
+        "confidence": 0.7,
+        "governance_state": "candidate",
+        "read_state": {"age_days": 91, "decay_score": 0.49, "archive_recommended": True},
+        "source_refs": [{"layer": "L2", "item_id": "fact:1"}],
+        "created_at": "2026-01-01T00:00:00Z",
+    }]
+
+    items = collect_l4_items(records)
+
+    assert items[0].item_id == "L4:l4_a"
+    assert items[0].layer == "L4"
+    assert items[0].score == 0.49
+    assert items[0].reason_code == "l4_candidate_decay"
+    assert "archive recommended" in items[0].reason

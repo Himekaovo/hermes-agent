@@ -4,6 +4,7 @@ from collections import defaultdict
 from dataclasses import replace
 from datetime import datetime, timezone
 from math import floor
+from pathlib import Path
 
 from .contracts import (
     AUTHORITY_RANK,
@@ -179,3 +180,76 @@ def render_context(items: list[MnemosyneItem], config: MnemosyneConfig) -> str:
     if len(rendered) > config.total_char_budget:
         return rendered[:config.total_char_budget].rstrip()
     return rendered
+
+
+def collect_l1_items(
+    hermes_home: Path,
+    *,
+    include_sensitive: bool,
+    query: str = "",
+) -> tuple[list[MnemosyneItem], list[dict[str, object]]]:
+    items: list[MnemosyneItem] = []
+    diagnostics: list[dict[str, object]] = []
+    memory_dir = Path(hermes_home) / "memories"
+    filenames = ["MEMORY.md"] + (["USER.md"] if include_sensitive else [])
+    for name in filenames:
+        path = memory_dir / name
+        try:
+            resolved = path.resolve()
+            resolved.relative_to(Path(hermes_home).resolve())
+        except Exception:
+            return [], [{"reason": "security_invariant_failure", "source": name}]
+        if not path.exists():
+            continue
+        try:
+            content = path.read_text(encoding="utf-8")
+        except UnicodeError:
+            diagnostics.append({"reason": "l1_encoding_error", "source": name})
+            continue
+        stripped = content.strip()
+        if not stripped:
+            continue
+        source = f"memories/{name}"
+        item_id = f"L1:{name}"
+        items.append(MnemosyneItem(
+            item_id=item_id,
+            layer="L1",
+            content=stripped,
+            reason=f"core profile entry from {name}",
+            reason_code="l1_core_file",
+            reason_detail=(("file", name),),
+            score=1.0,
+            source=source,
+            provenance=(),
+            trust=1.0,
+        ))
+    return items, diagnostics
+
+
+def collect_l4_items(l4_records: list[dict[str, object]]) -> list[MnemosyneItem]:
+    items: list[MnemosyneItem] = []
+    for record in l4_records:
+        read_state = record.get("read_state")
+        if not isinstance(read_state, dict):
+            continue
+        score = float(read_state.get("decay_score", 0.0))
+        archive = bool(read_state.get("archive_recommended", False))
+        reason = "L4 candidate"
+        if archive:
+            reason += "; archive recommended"
+        items.append(MnemosyneItem(
+            item_id=f"L4:{record.get('record_id')}",
+            layer="L4",
+            content=str(record.get("content") or ""),
+            reason=reason,
+            reason_code="l4_candidate_decay",
+            reason_detail=(
+                ("governance_state", str(record.get("governance_state"))),
+                ("archive_recommended", archive),
+            ),
+            score=score,
+            source="mnemosyne:l4",
+            provenance=(),
+            trust=float(record.get("confidence", 0.5)),
+        ))
+    return items
