@@ -201,7 +201,6 @@ Each valid record uses this contract:
     "agent_id": "...",
     "execution_kind": "interactive" | "cron" | "subagent" | "flush",
     "confidence": 0.0,
-    "decay_score": 1.0,
     "governance_state": "candidate" | "approved" | "rejected" | "archived",
     "source_refs": [{"layer": "L2", "item_id": "fact:123"}],
     "created_at": "2026-07-28T00:00:00Z",
@@ -214,6 +213,11 @@ Each valid record uses this contract:
 also store `status`, `record_state`, or any second lifecycle axis. This avoids
 illegal split-brain combinations such as an approved record whose governance
 state is still candidate.
+
+`decay_score`, `age_days`, and `archive_recommended` are read-time derived
+values, not persisted fields. New L4 records must not write `decay_score`. If a
+future or legacy record contains a persisted `decay_score`, the v1 reader ignores
+that field and uses the deterministic formula in section 13.
 
 `on_session_end()` may write L4 candidates through the controlled Mnemosyne L4
 candidate API. That is the only new persistence path in this phase. L4 candidate
@@ -527,8 +531,8 @@ must remain under the resolved trusted profile root.
 
 ## 12. Injection budgeting and ranking
 
-`prefetch()` uses a total character budget and per-layer caps. Budgets are
-configurable but bounded.
+`prefetch()` uses a total character budget, initial per-layer allocations, and
+hard per-layer caps. Budgets are configurable but bounded.
 
 V1 defaults:
 
@@ -538,11 +542,16 @@ mnemosyne:
   max_total_char_budget: 12000
   max_items_per_layer: 8
   max_item_chars: 1000
-  layer_budgets:
+  initial_layer_budgets:
     L1: 1200
     L2: 3200
     L3: 800
     L4: 800
+  hard_layer_caps:
+    L1: 2400
+    L2: 6000
+    L3: 1600
+    L4: 1600
   cron_multiplier: 0.5
   subagent_multiplier: 0.5
 ```
@@ -558,11 +567,18 @@ Truncation is deterministic:
 1. Adapter outputs are first clipped to `max_item_chars` per item, preserving the
    beginning of `content` and a complete sanitized `reason`.
 2. Items are sorted with the final tuple sort below.
-3. Items are appended while both the layer budget and total budget permit.
+3. Each layer first receives up to its `initial_layer_budgets` allocation.
 4. If an item does not fit after clipping, it is skipped rather than partially
    emitting malformed context.
-5. If a layer has unused budget, that budget may be borrowed by L2, then L1,
-   then L4, then L3, in that order, without exceeding `total_char_budget`.
+5. Unused initial allocation enters a shared pool.
+6. The shared pool is borrowed in this order: L2, then L1, then L4, then L3.
+7. Borrowing may exceed the initial allocation but must not exceed that layer's
+   `hard_layer_caps` value.
+8. The final block must never exceed `total_char_budget`.
+
+In other words, `initial_layer_budgets` are allocations and `hard_layer_caps`
+are caps. For example, if L3 has no results, L2 may grow beyond 3200 characters
+but must stay at or below 6000 characters and the global 6000-character total.
 
 Default ranking:
 
@@ -620,6 +636,9 @@ Rules:
 - `archive_recommended=True` may be returned for stale L4 records.
 - Querying or prefetching must not change `governance_state`, `archived_at`, or
   `last_validated_at`.
+- Querying or prefetching must not write derived `decay_score` back to JSONL.
+- Time passing changes read-time derived state only; it does not mutate the L4
+  file.
 - Automatic archive is out of scope.
 
 V1 decay:
@@ -629,6 +648,16 @@ reference_time = last_validated_at or created_at
 age_days = max(0, floor((now_utc - reference_time).total_seconds() / 86400))
 decay_score = max(0.0, 1.0 - age_days / 180.0)
 archive_recommended = age_days >= 90
+```
+
+Read-time derived state can be represented as:
+
+```python
+@dataclass(frozen=True)
+class L4ReadState:
+    age_days: int
+    decay_score: float
+    archive_recommended: bool
 ```
 
 Invalid timestamps make the record unavailable for injection and add a
@@ -689,6 +718,8 @@ Focused tests:
 - L3 includes only visible, non-disabled skills and never changes lifecycle.
 - L4 candidate writes are profile-scoped, locked, atomic, bounded, and
   malformed-line preserving.
+- L4 persisted records do not include `decay_score`, and legacy persisted
+  `decay_score` values are ignored on read.
 - L4 candidate writes preserve malformed lines byte-for-byte while adding valid
   records through lock-protected atomic rewrite.
 - Repeated `on_session_end(messages)` calls produce one L4 record for the same
@@ -707,10 +738,15 @@ Focused tests:
 - Security invariant failures disable the provider lifecycle and do not read or
   write disputed paths.
 - Symlink escape under `memories/mnemosyne/` is rejected by resolved-path checks.
-- Default budgets, per-item caps, skip-on-overflow truncation, and stable
-  `item_id` tie-break sorting are deterministic.
+- Default budgets, per-item caps, skip-on-overflow truncation, shared-pool
+  borrowing, hard-layer caps, and stable `item_id` tie-break sorting are
+  deterministic.
+- Empty L3 budget can be borrowed by L2, but L2 never exceeds its hard cap or
+  the total budget.
 - L4 age over 90 days returns `archive_recommended=True` without changing
   `governance_state` or `archived_at`.
+- L4 read-time decay changes as time advances, but JSONL content remains
+  unchanged.
 - L4 future timestamps are clamped to `age_days = 0`; invalid timestamps are not
   injected.
 - L3 Skill/API intent routing uses deterministic keywords/tool names only and
