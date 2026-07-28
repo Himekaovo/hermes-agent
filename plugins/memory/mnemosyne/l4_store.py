@@ -3,8 +3,10 @@ from __future__ import annotations
 import errno
 import json
 import os
+import secrets
 import tempfile
 import threading
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from hashlib import sha256
@@ -17,6 +19,14 @@ _LOCKS: dict[str, threading.RLock] = {}
 _LOCKS_GUARD = threading.Lock()
 L4_RELATIVE_PATH = Path("memories") / "mnemosyne" / "l4.jsonl"
 _READ_TIME_FIELDS = ("decay_score", "age_days", "archive_recommended", "read_state")
+_LOCK_FILENAME = "l4.jsonl.lock"
+_DIR_FD_REWRITE_SUPPORTED = (
+    os.name == "posix"
+    and hasattr(os, "O_DIRECTORY")
+    and hasattr(os, "O_NOFOLLOW")
+    and os.open in os.supports_dir_fd
+    and os.rename in os.supports_dir_fd
+)
 
 
 class SecurityInvariantError(RuntimeError):
@@ -178,21 +188,169 @@ class L4Store:
                 _LOCKS[key] = lock
             return lock
 
-    def _read_raw_lines(self) -> list[bytes]:
-        self.ensure_available()
-        if not self.path.exists():
-            return []
+    @contextmanager
+    def _trusted_parent_dir_fd(self, *, create: bool):
+        """Hold the real L4 parent directory open while a write is in flight."""
+        if not _DIR_FD_REWRITE_SUPPORTED:
+            yield None
+            return
+
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        fds: list[int] = []
+        try:
+            try:
+                current_fd = os.open(str(self.hermes_home), flags)
+            except OSError as exc:
+                if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+                    raise SecurityInvariantError(
+                        f"trusted root is not a directory: {self.hermes_home}"
+                    ) from exc
+                raise
+            fds.append(current_fd)
+            for part in L4_RELATIVE_PATH.parts[:-1]:
+                if create:
+                    try:
+                        os.mkdir(part, mode=0o700, dir_fd=current_fd)
+                    except FileExistsError:
+                        pass
+                try:
+                    next_fd = os.open(part, flags, dir_fd=current_fd)
+                except FileNotFoundError:
+                    if create:
+                        raise
+                    yield None
+                    return
+                except OSError as exc:
+                    if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+                        raise SecurityInvariantError(
+                            f"path traverses symlink: {self.path.parent}"
+                        ) from exc
+                    raise
+                fds.append(next_fd)
+                current_fd = next_fd
+            yield current_fd
+        finally:
+            for fd in reversed(fds):
+                os.close(fd)
+
+    @contextmanager
+    def _interprocess_lock(self, parent_fd: Optional[int]):
+        """Serialize L4 read-modify-replace cycles across local processes."""
+        flags = os.O_CREAT | os.O_RDWR
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            if parent_fd is None:
+                lock_path = self.path.with_name(_LOCK_FILENAME)
+                lock_path.parent.mkdir(parents=True, exist_ok=True)
+                assert_trusted_path(lock_path, self.hermes_home)
+                lock_fd = os.open(str(lock_path), flags, 0o600)
+            else:
+                lock_fd = os.open(_LOCK_FILENAME, flags, 0o600, dir_fd=parent_fd)
+        except OSError as exc:
+            if exc.errno == errno.ELOOP:
+                raise SecurityInvariantError(f"path traverses symlink: {self.path.parent}") from exc
+            raise
+
+        unlock = None
+        try:
+            try:
+                import fcntl
+
+                fcntl.flock(lock_fd, fcntl.LOCK_EX)
+                unlock = lambda: fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            except (ImportError, OSError):
+                try:
+                    import msvcrt
+
+                    if os.fstat(lock_fd).st_size == 0:
+                        os.write(lock_fd, b"0")
+                    os.lseek(lock_fd, 0, os.SEEK_SET)
+                    msvcrt.locking(lock_fd, msvcrt.LK_LOCK, 1)
+                    unlock = lambda: msvcrt.locking(lock_fd, msvcrt.LK_UNLCK, 1)
+                except (ImportError, OSError):
+                    unlock = None
+            yield
+        finally:
+            if unlock is not None:
+                try:
+                    unlock()
+                except OSError:
+                    pass
+            os.close(lock_fd)
+
+    def _read_raw_lines(self, *, parent_fd: Optional[int] = None) -> list[bytes]:
+        if parent_fd is None and _DIR_FD_REWRITE_SUPPORTED:
+            with self._trusted_parent_dir_fd(create=False) as trusted_parent_fd:
+                if trusted_parent_fd is None:
+                    return []
+                return self._read_raw_lines(parent_fd=trusted_parent_fd)
+
         flags = os.O_RDONLY
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
         try:
-            fd = os.open(self.path, flags)
+            if parent_fd is None:
+                self.ensure_available()
+                if not self.path.exists():
+                    return []
+                fd = os.open(self.path, flags)
+            else:
+                fd = os.open("l4.jsonl", flags, dir_fd=parent_fd)
+        except FileNotFoundError:
+            return []
         except OSError as exc:
-            if self.path.is_symlink() or exc.errno == errno.ELOOP:
+            if exc.errno == errno.ELOOP or self.path.is_symlink():
                 raise SecurityInvariantError(f"path traverses symlink: {self.path}") from exc
             raise
         with os.fdopen(fd, "rb") as handle:
             return handle.read().splitlines(keepends=True)
+
+    def _rewrite_with_dir_fd(self, parent_fd: int, content: bytes) -> None:
+        flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW
+        for _ in range(32):
+            temp_name = f".l4-{secrets.token_hex(12)}.tmp"
+            try:
+                fd = os.open(temp_name, flags, 0o600, dir_fd=parent_fd)
+                break
+            except FileExistsError:
+                continue
+        else:
+            raise RuntimeError("could not create unique L4 temporary file")
+
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(
+                temp_name,
+                "l4.jsonl",
+                src_dir_fd=parent_fd,
+                dst_dir_fd=parent_fd,
+            )
+            os.fsync(parent_fd)
+        finally:
+            try:
+                os.unlink(temp_name, dir_fd=parent_fd)
+            except FileNotFoundError:
+                pass
+
+    def _rewrite_fallback(self, content: bytes) -> None:
+        self.ensure_available()
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.ensure_available()
+        fd, temp_name = tempfile.mkstemp(prefix=".l4-", suffix=".tmp", dir=str(self.path.parent))
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+            self.ensure_available()
+            os.replace(temp_name, self.path)
+        finally:
+            if os.path.exists(temp_name):
+                os.unlink(temp_name)
 
     def write_candidate(self, record: L4CandidateRecord) -> dict[str, object]:
         if self._disabled:
@@ -212,47 +370,37 @@ class L4Store:
         if "\n" in line_text or len(line_text) > self.config.max_l4_record_chars:
             return {"written": False, "reason": "record_too_large"}
         line = (line_text + "\n").encode("utf-8")
-        with self._lock():
-            self.ensure_available()
-            raw_lines = self._read_raw_lines()
-            valid_ids = set()
-            for raw in raw_lines:
-                try:
-                    parsed = json.loads(raw.decode("utf-8"))
-                except Exception:
-                    continue
-                if isinstance(parsed, dict) and isinstance(parsed.get("record_id"), str):
-                    valid_ids.add(parsed["record_id"])
-            if record.record_id in valid_ids:
-                return {"written": False, "reason": "duplicate"}
-            existing = b"".join(raw_lines)
-            separator = b"" if not existing or existing.endswith((b"\n", b"\r")) else b"\n"
-            final = existing + separator + line
-            if len(final.decode("utf-8", errors="ignore")) > self.config.max_l4_file_chars:
-                return {"written": False, "reason": "file_too_large"}
-            self.ensure_available()
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            self.ensure_available()
-            fd, tmp_name = tempfile.mkstemp(prefix=".l4-", suffix=".tmp", dir=str(self.path.parent))
-            try:
-                with os.fdopen(fd, "wb") as handle:
-                    handle.write(final)
-                    handle.flush()
-                    os.fsync(handle.fileno())
-                self.ensure_available()
-                os.replace(tmp_name, self.path)
-                try:
-                    dir_fd = os.open(str(self.path.parent), os.O_DIRECTORY)
-                except (AttributeError, OSError):
-                    dir_fd = None
-                if dir_fd is not None:
-                    try:
-                        os.fsync(dir_fd)
-                    finally:
-                        os.close(dir_fd)
-            finally:
-                if os.path.exists(tmp_name):
-                    os.unlink(tmp_name)
+        try:
+            with self._lock():
+                with self._trusted_parent_dir_fd(create=True) as parent_fd:
+                    with self._interprocess_lock(parent_fd):
+                        raw_lines = self._read_raw_lines(parent_fd=parent_fd)
+                        valid_ids = set()
+                        for raw in raw_lines:
+                            try:
+                                parsed = json.loads(raw.decode("utf-8"))
+                            except Exception:
+                                continue
+                            if isinstance(parsed, dict) and isinstance(parsed.get("record_id"), str):
+                                if parsed.get("profile_id") != self.profile_id:
+                                    raise SecurityInvariantError(
+                                        "existing L4 record profile_id does not match L4 store profile_id"
+                                    )
+                                valid_ids.add(parsed["record_id"])
+                        if record.record_id in valid_ids:
+                            return {"written": False, "reason": "duplicate"}
+                        existing = b"".join(raw_lines)
+                        separator = b"" if not existing or existing.endswith((b"\n", b"\r")) else b"\n"
+                        final = existing + separator + line
+                        if len(final.decode("utf-8", errors="ignore")) > self.config.max_l4_file_chars:
+                            return {"written": False, "reason": "file_too_large"}
+                        if parent_fd is None:
+                            self._rewrite_fallback(final)
+                        else:
+                            self._rewrite_with_dir_fd(parent_fd, final)
+        except SecurityInvariantError:
+            self._disabled = True
+            raise
         return {"written": True, "record_id": record.record_id}
 
     def read_records(self, now: Optional[datetime] = None) -> tuple[list[dict[str, object]], list[dict[str, object]]]:

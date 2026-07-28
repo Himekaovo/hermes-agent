@@ -162,6 +162,65 @@ GREEN: after the write-boundary re-sanitization:
 `./.venv/bin/python -m py_compile plugins/memory/mnemosyne/l4_store.py` and
 `git diff --check` completed successfully.
 
+## Storage Safety Follow-up Fixes
+
+- POSIX rewrites now keep the trusted `memories/mnemosyne` directory open by
+  descriptor from traversal through replacement. The traversal uses
+  `O_DIRECTORY | O_NOFOLLOW` with `dir_fd`; temporary files are created with
+  `O_CREAT | O_EXCL | O_WRONLY` relative to that descriptor; replacement uses
+  `os.replace(..., src_dir_fd=..., dst_dir_fd=...)`. The old `mkstemp(dir=...)`
+  path remains only for platforms without directory-fd support.
+- `l4.jsonl.lock` now serializes the complete read, profile-boundary check,
+  duplicate check, and rewrite cycle across processes. It uses `fcntl.flock`
+  on POSIX, `msvcrt.locking` on Windows, and only falls back to no OS lock when
+  neither primitive is available.
+- Writes now examine parsed valid existing records while the interprocess lock
+  is held. A record with a different `profile_id` disables the store and raises
+  `SecurityInvariantError` before any candidate is appended.
+- Reads also use the trusted parent descriptor on directory-fd platforms.
+
+## Storage Safety Regression TDD Evidence
+
+RED: focused regressions were added and run before the production changes:
+
+```text
+./.venv/bin/python -m pytest -q \
+  tests/plugins/memory/test_mnemosyne.py::test_l4_write_rejects_existing_valid_record_from_another_profile \
+  tests/plugins/memory/test_mnemosyne.py::test_l4_interprocess_writes_preserve_both_candidates \
+  tests/plugins/memory/test_mnemosyne.py::test_l4_rewrite_uses_trusted_directory_fds
+
+FFs
+2 failed, 1 skipped in 0.12s
+```
+
+The failures showed that a valid other-profile record was accepted for append
+and that separate processes could each read stale content before their later
+atomic replacements, losing one candidate. The first directory-fd regression
+was skipped by an overly narrow capability probe; after correcting that probe,
+the same runtime assertion was executed against the pre-fix `2d1ea5633`
+implementation and failed with `AssertionError`, because its temporary create
+and replacement did not use trusted directory descriptors.
+
+GREEN:
+
+```text
+./.venv/bin/python -m pytest -q \
+  tests/plugins/memory/test_mnemosyne.py::test_l4_write_rejects_existing_valid_record_from_another_profile \
+  tests/plugins/memory/test_mnemosyne.py::test_l4_interprocess_writes_preserve_both_candidates \
+  tests/plugins/memory/test_mnemosyne.py::test_l4_rewrite_uses_trusted_directory_fds
+
+3 passed in 1.13s
+```
+
+```text
+./.venv/bin/python -m pytest -q tests/plugins/memory/test_mnemosyne.py
+
+22 passed in 1.14s
+```
+
+`./.venv/bin/python -m py_compile plugins/memory/mnemosyne/l4_store.py` and
+`git diff --check` completed successfully.
+
 ## Critical Re-review Fixes
 
 - `_canonical_payload` is now immutable canonical JSON text rather than a mutable
