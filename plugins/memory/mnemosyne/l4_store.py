@@ -5,7 +5,6 @@ import json
 import os
 import tempfile
 import threading
-from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from hashlib import sha256
@@ -80,7 +79,7 @@ def candidate_record_id(record: Mapping[str, object]) -> str:
 class L4CandidateRecord:
     payload: dict[str, object]
     record_id: str
-    _canonical_payload: dict[str, object] = field(default_factory=dict, repr=False)
+    _canonical_payload: str = field(repr=False)
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, object]) -> "L4CandidateRecord":
@@ -99,22 +98,27 @@ class L4CandidateRecord:
             raise ValueError("parent_session_id must be a string or None")
         record_id = candidate_record_id(payload)
         payload["record_id"] = record_id
-        if "\n" in json.dumps(payload, sort_keys=True, ensure_ascii=False):
+        canonical_payload = json.dumps(payload, sort_keys=True, ensure_ascii=False)
+        if "\n" in canonical_payload:
             raise ValueError("L4 record must serialize to one JSONL line")
         return cls(
             payload=payload,
             record_id=record_id,
-            _canonical_payload=deepcopy(payload),
+            _canonical_payload=canonical_payload,
         )
 
 
 def _persistence_payload(record: L4CandidateRecord) -> dict[str, object]:
-    payload = deepcopy(record._canonical_payload or record.payload)
+    payload = json.loads(record._canonical_payload)
+    if not isinstance(payload, dict):
+        raise ValueError("canonical L4 payload must be an object")
     for field in _READ_TIME_FIELDS:
         payload.pop(field, None)
     payload.setdefault("parent_session_id", None)
     if payload["parent_session_id"] is not None and not isinstance(payload["parent_session_id"], str):
         raise ValueError("parent_session_id must be a string or None")
+    if candidate_record_id(payload) != record.record_id:
+        raise ValueError("canonical L4 payload does not match record_id")
     payload["record_id"] = record.record_id
     return payload
 
@@ -198,9 +202,13 @@ class L4Store:
         except SecurityInvariantError:
             self._disabled = True
             raise
-        if record.payload.get("profile_id") != self.profile_id:
+        persistence_payload = _persistence_payload(record)
+        if (
+            record.payload.get("profile_id") != self.profile_id
+            or persistence_payload.get("profile_id") != self.profile_id
+        ):
             raise ValueError("record profile_id does not match L4 store profile_id")
-        line_text = json.dumps(_persistence_payload(record), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        line_text = json.dumps(persistence_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         if "\n" in line_text or len(line_text) > self.config.max_l4_record_chars:
             return {"written": False, "reason": "record_too_large"}
         line = (line_text + "\n").encode("utf-8")
