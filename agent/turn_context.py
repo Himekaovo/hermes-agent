@@ -37,6 +37,7 @@ from agent.model_metadata import (
     estimate_messages_tokens_rough,
     estimate_request_tokens_rough,
 )
+from agent.safety_hooks import bounded_context
 
 logger = logging.getLogger(__name__)
 
@@ -159,6 +160,137 @@ def append_notes_to_multimodal_content(content: Any, notes: str) -> bool:
         return True
     except Exception:
         return False
+
+
+def _trusted_agent_id(agent: Any) -> str:
+    try:
+        from hermes_cli.profiles import get_active_profile_name
+
+        profile = bounded_context(get_active_profile_name(), max_chars=120).strip()
+        if profile:
+            return profile
+    except Exception:
+        pass
+    return "hermes"
+
+
+def _trusted_execution_kind(agent: Any) -> str:
+    if getattr(agent, "platform", None) == "cron":
+        return "cron"
+    if getattr(agent, "_parent_session_id", None):
+        return "subagent"
+    return "interactive"
+
+
+def _collect_pre_llm_context(results: list[Any], agent: Any) -> str:
+    ctx_parts: list[str] = []
+    # Spill oversized per-hook context to disk so a runaway plugin
+    # can't inflate every subsequent turn's prompt. Ported from
+    # openai/codex PR #21069 ("Spill large hook outputs from context").
+    try:
+        from tools.hook_output_spill import (
+            get_spill_config as _spill_cfg,
+            spill_if_oversized as _spill_if_oversized,
+        )
+
+        spill_config_cached = _spill_cfg()
+    except Exception:
+        _spill_if_oversized = None  # type: ignore[assignment]
+        spill_config_cached = None
+    for result in results:
+        piece = ""
+        if isinstance(result, dict):
+            action = str(result.get("action") or "").strip().lower()
+            if action in {"block", "error", "skip"}:
+                continue
+            if result.get("context"):
+                piece = bounded_context(result["context"])
+        elif isinstance(result, str) and result.strip():
+            piece = bounded_context(result)
+        else:
+            continue
+        if not piece:
+            continue
+        if _spill_if_oversized is not None:
+            try:
+                piece = _spill_if_oversized(
+                    piece,
+                    session_id=agent.session_id,
+                    source="plugin hook",
+                    config=spill_config_cached,
+                )
+            except Exception as spill_exc:
+                logger.warning("hook context spill failed: %s", spill_exc)
+        ctx_parts.append(piece)
+    return "\n\n".join(ctx_parts)
+
+
+def _install_safety_block_short_circuit(
+    agent: Any,
+    *,
+    messages: list[dict[str, Any]],
+    conversation_history: Optional[list[dict[str, Any]]],
+    effective_task_id: str,
+    turn_id: str,
+    user_message: Any,
+    original_user_message: Any,
+    should_review_memory: bool,
+    safety_results: list[dict[str, Any]],
+) -> None:
+    block_results = [
+        result
+        for result in safety_results
+        if isinstance(result, dict) and str(result.get("action") or "").strip().lower() == "block"
+    ]
+    if not block_results:
+        return
+    block_message = next(
+        (
+            bounded_context(result.get("message"), max_chars=400).strip()
+            for result in block_results
+            if bounded_context(result.get("message"), max_chars=400).strip()
+        ),
+        "",
+    ) or "Request blocked by safety checks."
+    original_api_mode = getattr(agent, "api_mode", None)
+    original_runner = getattr(agent, "_run_codex_app_server_turn", None)
+
+    def _blocked_turn(**_kwargs: Any) -> dict[str, Any]:
+        try:
+            from agent.turn_finalizer import finalize_turn
+
+            result = finalize_turn(
+                agent,
+                final_response=block_message,
+                api_call_count=0,
+                interrupted=False,
+                failed=True,
+                messages=messages,
+                conversation_history=conversation_history,
+                effective_task_id=effective_task_id,
+                turn_id=turn_id,
+                user_message=user_message,
+                original_user_message=original_user_message,
+                _should_review_memory=should_review_memory,
+                _turn_exit_reason="safety_blocked",
+                _pending_verification_response=None,
+            )
+            result["safety_blocked"] = True
+            result["safety_results"] = list(safety_results)
+            result["error"] = f"safety_blocked: {block_message}"
+            return result
+        finally:
+            agent.api_mode = original_api_mode
+            if original_runner is None:
+                try:
+                    delattr(agent, "_run_codex_app_server_turn")
+                except AttributeError:
+                    pass
+            else:
+                agent._run_codex_app_server_turn = original_runner
+
+    agent._run_codex_app_server_turn = _blocked_turn
+    agent.api_mode = "codex_app_server"
 
 
 def reanchor_current_turn_user_idx(messages: List[Any], user_message: Any) -> int:
@@ -695,7 +827,10 @@ def build_turn_context(
         from hermes_cli.plugins import invoke_hook as _invoke_hook
         _pre_results = _invoke_hook(
             "pre_llm_call",
+            agent_id=_trusted_agent_id(agent),
+            execution_kind=_trusted_execution_kind(agent),
             session_id=agent.session_id,
+            parent_session_id=getattr(agent, "_parent_session_id", None),
             task_id=effective_task_id,
             turn_id=turn_id,
             user_message=original_user_message,
@@ -705,40 +840,20 @@ def build_turn_context(
             platform=getattr(agent, "platform", None) or "",
             sender_id=getattr(agent, "_user_id", None) or "",
         )
-        _ctx_parts: list[str] = []
-        # Spill oversized per-hook context to disk so a runaway plugin
-        # can't inflate every subsequent turn's prompt. Ported from
-        # openai/codex PR #21069 ("Spill large hook outputs from context").
-        try:
-            from tools.hook_output_spill import (
-                get_spill_config as _spill_cfg,
-                spill_if_oversized as _spill_if_oversized,
-            )
-            _spill_config_cached = _spill_cfg()
-        except Exception:
-            _spill_if_oversized = None  # type: ignore[assignment]
-            _spill_config_cached = None
-        for r in _pre_results:
-            _piece: str = ""
-            if isinstance(r, dict) and r.get("context"):
-                _piece = str(r["context"])
-            elif isinstance(r, str) and r.strip():
-                _piece = r
-            else:
-                continue
-            if _spill_if_oversized is not None:
-                try:
-                    _piece = _spill_if_oversized(
-                        _piece,
-                        session_id=agent.session_id,
-                        source="plugin hook",
-                        config=_spill_config_cached,
-                    )
-                except Exception as _spill_exc:
-                    logger.warning("hook context spill failed: %s", _spill_exc)
-            _ctx_parts.append(_piece)
-        if _ctx_parts:
-            plugin_user_context = "\n\n".join(_ctx_parts)
+        _install_safety_block_short_circuit(
+            agent,
+            messages=messages,
+            conversation_history=conversation_history,
+            effective_task_id=effective_task_id,
+            turn_id=turn_id,
+            user_message=user_message,
+            original_user_message=original_user_message,
+            should_review_memory=should_review_memory,
+            safety_results=[
+                result for result in _pre_results if isinstance(result, dict)
+            ],
+        )
+        plugin_user_context = _collect_pre_llm_context(_pre_results, agent)
     except Exception as exc:
         logger.warning("pre_llm_call hook failed: %s", exc)
 

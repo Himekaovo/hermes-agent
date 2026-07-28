@@ -3,6 +3,18 @@ import json
 import pytest
 
 
+def test_build_safety_hook_overrides_returns_fresh_pre_llm_callback_lists():
+    from agent.safety_hooks import build_safety_hook_overrides
+
+    first = build_safety_hook_overrides()
+    second = build_safety_hook_overrides()
+
+    assert "pre_llm_call" in first
+    assert "pre_llm_call" in second
+    assert first["pre_llm_call"] is not second["pre_llm_call"]
+    assert first["pre_llm_call"][0] is not second["pre_llm_call"][0]
+
+
 def test_safety_result_is_json_serializable_and_redacts_secret_values():
     from agent.safety_hooks import make_result
 

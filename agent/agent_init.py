@@ -557,11 +557,17 @@ def init_agent(
         ).start()
 
     agent.tool_progress_callback = tool_progress_callback
-    agent.hook_overrides = {
-        str(name): list(callbacks)
-        for name, callbacks in (hook_overrides or {}).items()
-        if isinstance(callbacks, (list, tuple)) and callbacks
-    }
+    from agent.safety_hooks import build_safety_hook_overrides
+
+    agent.hook_overrides = {}
+    for _override_source in (
+        build_safety_hook_overrides(),
+        hook_overrides or {},
+    ):
+        for name, callbacks in _override_source.items():
+            if not isinstance(callbacks, (list, tuple)) or not callbacks:
+                continue
+            agent.hook_overrides.setdefault(str(name), []).extend(list(callbacks))
     agent.tool_start_callback = tool_start_callback
     agent.tool_complete_callback = tool_complete_callback
     agent.suppress_status_output = False
