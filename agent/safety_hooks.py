@@ -53,6 +53,7 @@ _PROMPT_INJECTION_PATTERNS = (
     "reveal the prompt",
 )
 _DEFAULT_AUDIT_PATH = Path("logs") / "safety" / "session-archiver.jsonl"
+_SAFE_AUDIT_FALLBACK_BASENAME = ".hermes-safe-session-archiver"
 _DEFAULT_SAFETY_HOOKS_CONFIG = {
     "enabled": True,
     "block_high_risk": True,
@@ -99,10 +100,37 @@ def _warn_invalid_config(key: str, value: Any, *, reason: str) -> None:
     )
 
 
+def _resolved_path_within_home(candidate: Path, home: Path) -> Path | None:
+    resolved = candidate.resolve(strict=False)
+    try:
+        resolved.relative_to(home)
+    except ValueError:
+        return None
+    return resolved
+
+
+def _safe_in_home_audit_fallback(home: Path) -> Path:
+    suffix = _DEFAULT_AUDIT_PATH.suffix
+    attempt = 0
+    while True:
+        basename = _SAFE_AUDIT_FALLBACK_BASENAME
+        if attempt:
+            basename = f"{basename}-{attempt}"
+        candidate = home / f"{basename}{suffix}"
+        resolved = _resolved_path_within_home(candidate, home)
+        if resolved is not None:
+            return resolved
+        attempt += 1
+
+
 def _resolve_default_audit_path() -> Path:
     from hermes_constants import get_hermes_home
 
-    return (get_hermes_home() / _DEFAULT_AUDIT_PATH).resolve(strict=False)
+    home = get_hermes_home().resolve(strict=False)
+    default_path = _resolved_path_within_home(home / _DEFAULT_AUDIT_PATH, home)
+    if default_path is not None:
+        return default_path
+    return _safe_in_home_audit_fallback(home)
 
 
 def _resolve_audit_path(value: Any) -> str:

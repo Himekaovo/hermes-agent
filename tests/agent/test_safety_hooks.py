@@ -152,6 +152,25 @@ def test_safety_hook_config_rejects_absolute_external_audit_path(
     assert "audit" in caplog.text.lower()
 
 
+def test_default_audit_path_falls_back_inside_profile_when_logs_symlink_escapes(
+    tmp_path, monkeypatch
+):
+    from agent.safety_hooks import _resolve_default_audit_path
+
+    profile_home = tmp_path / "profiles" / "writer"
+    profile_home.mkdir(parents=True)
+    outside_dir = tmp_path / "outside"
+    outside_dir.mkdir()
+    escaped_target = outside_dir / "safety" / "session-archiver.jsonl"
+    (profile_home / "logs").symlink_to(outside_dir, target_is_directory=True)
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+
+    resolved = _resolve_default_audit_path().resolve()
+
+    assert resolved.is_relative_to(profile_home.resolve())
+    assert resolved != escaped_target.resolve()
+
+
 def test_safety_hook_config_rejects_symlink_escape_audit_path(
     tmp_path, monkeypatch, caplog
 ):
@@ -167,9 +186,10 @@ def test_safety_hook_config_rejects_symlink_escape_audit_path(
     with caplog.at_level("WARNING"):
         config = normalize_config({"audit_path": "logs/escape.jsonl"})
 
-    assert Path(config["audit_path"]).resolve() == (
-        profile_home / "logs" / "safety" / "session-archiver.jsonl"
-    ).resolve()
+    resolved = Path(config["audit_path"]).resolve()
+
+    assert resolved.is_relative_to(profile_home.resolve())
+    assert resolved != (outside_dir / "safety" / "session-archiver.jsonl").resolve()
     assert "audit" in caplog.text.lower()
 
 
