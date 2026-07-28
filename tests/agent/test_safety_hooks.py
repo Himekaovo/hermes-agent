@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 import pytest
 
@@ -76,6 +77,92 @@ def test_context_is_capped_before_it_can_be_returned():
     from agent.safety_hooks import bounded_context
 
     assert len(bounded_context("x" * 100, max_chars=12)) <= 12
+
+
+def test_invalid_safety_hook_config_uses_safe_defaults(caplog):
+    from agent.safety_hooks import normalize_config
+
+    with caplog.at_level("WARNING"):
+        config = normalize_config(
+            {
+                "enabled": "not-a-bool",
+                "block_high_risk": object(),
+                "max_context_chars": -1,
+            }
+        )
+
+    assert config["enabled"] is True
+    assert config["block_high_risk"] is True
+    assert config["max_context_chars"] == 12000
+    assert "safety" in caplog.text.lower()
+
+
+def test_safety_hook_config_clamps_positive_context_limit():
+    from agent.safety_hooks import normalize_config
+
+    config = normalize_config({"max_context_chars": 25000})
+
+    assert config["max_context_chars"] == 12000
+
+
+def test_safety_hook_config_rejects_traversal_audit_path(tmp_path, monkeypatch, caplog):
+    from agent.safety_hooks import normalize_config
+
+    profile_home = tmp_path / "profiles" / "coder"
+    profile_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+
+    with caplog.at_level("WARNING"):
+        config = normalize_config({"audit_path": "../outside.jsonl"})
+
+    assert Path(config["audit_path"]).resolve() == (
+        profile_home / "logs" / "safety" / "session-archiver.jsonl"
+    ).resolve()
+    assert "audit" in caplog.text.lower()
+
+
+def test_safety_hook_config_rejects_absolute_external_audit_path(
+    tmp_path, monkeypatch, caplog
+):
+    from agent.safety_hooks import normalize_config
+
+    profile_home = tmp_path / "profiles" / "writer"
+    profile_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+
+    with caplog.at_level("WARNING"):
+        config = normalize_config({"audit_path": str(tmp_path / "external.jsonl")})
+
+    assert Path(config["audit_path"]).resolve() == (
+        profile_home / "logs" / "safety" / "session-archiver.jsonl"
+    ).resolve()
+    assert "audit" in caplog.text.lower()
+
+
+def test_safety_hook_config_keeps_audit_paths_profile_scoped(tmp_path):
+    from agent.safety_hooks import normalize_config
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    prof_a = tmp_path / "profiles" / "alpha"
+    prof_b = tmp_path / "profiles" / "beta"
+    prof_a.mkdir(parents=True)
+    prof_b.mkdir(parents=True)
+
+    token_a = set_hermes_home_override(prof_a)
+    try:
+        cfg_a = normalize_config({"audit_path": "logs/safety/custom.jsonl"})
+    finally:
+        reset_hermes_home_override(token_a)
+
+    token_b = set_hermes_home_override(prof_b)
+    try:
+        cfg_b = normalize_config({"audit_path": "logs/safety/custom.jsonl"})
+    finally:
+        reset_hermes_home_override(token_b)
+
+    assert Path(cfg_a["audit_path"]).resolve() == (prof_a / "logs" / "safety" / "custom.jsonl").resolve()
+    assert Path(cfg_b["audit_path"]).resolve() == (prof_b / "logs" / "safety" / "custom.jsonl").resolve()
+    assert cfg_a["audit_path"] != cfg_b["audit_path"]
 
 
 def test_normalize_execution_context_rejects_missing_required_fields():

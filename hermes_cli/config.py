@@ -1127,6 +1127,15 @@ DEFAULT_CONFIG = {
         # a human as chat noise. Doc/markdown/skill-only edits never fire it.
         # Set true to force on everywhere, or false to disable.
         "verify_on_stop": "auto",
+        # Deterministic pre/post/session safety hooks. ``audit_path`` is kept
+        # relative by default so it stays anchored inside the active profile
+        # HERMES_HOME when profiles/cron/subagents switch scope at runtime.
+        "safety_hooks": {
+            "enabled": True,
+            "block_high_risk": True,
+            "max_context_chars": 12000,
+            "audit_path": "logs/safety/session-archiver.jsonl",
+        },
         # Staged inactivity warning: send a warning to the user at this
         # threshold before escalating to a full timeout.  The warning fires
         # once per run and does not interrupt the agent.  0 = disable warning.

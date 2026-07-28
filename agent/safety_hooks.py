@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from collections.abc import Mapping
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from pathlib import Path, PurePath
 from typing import Any, Callable
 
+
+logger = logging.getLogger(__name__)
 
 ALLOWED_ACTIONS = frozenset({"allow", "warn", "block", "error", "skip"})
 ALLOWED_RISK_LEVELS = frozenset({"low", "medium", "high", "critical", "unknown"})
@@ -48,6 +52,18 @@ _PROMPT_INJECTION_PATTERNS = (
     "hidden prompt",
     "reveal the prompt",
 )
+_DEFAULT_AUDIT_PATH = Path("logs") / "safety" / "session-archiver.jsonl"
+_DEFAULT_SAFETY_HOOKS_CONFIG = {
+    "enabled": True,
+    "block_high_risk": True,
+    "max_context_chars": 12000,
+    "audit_path": str(_DEFAULT_AUDIT_PATH),
+}
+_MAX_CONTEXT_CHARS_LIMIT = int(_DEFAULT_SAFETY_HOOKS_CONFIG["max_context_chars"])
+_ACTIVE_CONTEXT_CHAR_LIMIT: ContextVar[int] = ContextVar(
+    "SAFETY_HOOK_CONTEXT_CHAR_LIMIT",
+    default=_MAX_CONTEXT_CHARS_LIMIT,
+)
 
 
 class ExecutionContextError(ValueError):
@@ -66,6 +82,90 @@ def bounded_context(value: Any, *, max_chars: int = _MAX_TEXT_CHARS) -> str:
     return text[:max_chars]
 
 
+def _active_context_char_limit() -> int:
+    try:
+        limit = int(_ACTIVE_CONTEXT_CHAR_LIMIT.get())
+    except (TypeError, ValueError):
+        limit = _MAX_CONTEXT_CHARS_LIMIT
+    return max(1, min(limit, _MAX_CONTEXT_CHARS_LIMIT))
+
+
+def _warn_invalid_config(key: str, value: Any, *, reason: str) -> None:
+    logger.warning(
+        "agent.safety_hooks.%s is invalid (%r): %s. Falling back to safe default.",
+        key,
+        value,
+        reason,
+    )
+
+
+def _resolve_default_audit_path() -> Path:
+    from hermes_constants import get_hermes_home
+
+    return (get_hermes_home() / _DEFAULT_AUDIT_PATH).resolve(strict=False)
+
+
+def _resolve_audit_path(value: Any) -> str:
+    from hermes_constants import get_hermes_home
+
+    default_path = _resolve_default_audit_path()
+    if value in (None, ""):
+        return str(default_path)
+    if not isinstance(value, (str, Path)):
+        _warn_invalid_config("audit_path", value, reason="expected a path-like string")
+        return str(default_path)
+
+    raw = Path(str(value).strip())
+    home = get_hermes_home().resolve(strict=False)
+    candidate = raw if raw.is_absolute() else home / raw
+    resolved = candidate.resolve(strict=False)
+    try:
+        resolved.relative_to(home)
+    except ValueError:
+        _warn_invalid_config(
+            "audit_path",
+            value,
+            reason="path must stay inside the active HERMES_HOME/profile",
+        )
+        return str(default_path)
+    return str(resolved)
+
+
+def normalize_config(raw_config: Any) -> dict[str, Any]:
+    config = raw_config if isinstance(raw_config, Mapping) else {}
+    normalized = dict(_DEFAULT_SAFETY_HOOKS_CONFIG)
+
+    for key in ("enabled", "block_high_risk"):
+        value = config.get(key, normalized[key])
+        if isinstance(value, bool):
+            normalized[key] = value
+        elif key in config:
+            _warn_invalid_config(key, value, reason="expected a boolean")
+
+    value = config.get("max_context_chars", normalized["max_context_chars"])
+    if isinstance(value, bool):
+        parsed = None
+    else:
+        try:
+            parsed = int(str(value).strip()) if isinstance(value, str) else int(value)
+        except (TypeError, ValueError):
+            parsed = None
+    if parsed is None or parsed <= 0:
+        if "max_context_chars" in config:
+            _warn_invalid_config(
+                "max_context_chars",
+                value,
+                reason="expected a positive integer",
+            )
+    else:
+        normalized["max_context_chars"] = max(1, min(parsed, _MAX_CONTEXT_CHARS_LIMIT))
+
+    normalized["audit_path"] = _resolve_audit_path(
+        config.get("audit_path", normalized["audit_path"])
+    )
+    return normalized
+
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
@@ -78,7 +178,7 @@ def _contains_secret_key(key: str) -> bool:
 def _sanitize_string(value: str) -> str:
     redacted = _SECRET_VALUE_RE.sub(r"\g<key>\g<sep>[REDACTED]", value)
     redacted = _SECRET_TOKEN_RE.sub(_REDACTED, redacted)
-    return bounded_context(redacted)
+    return bounded_context(redacted, max_chars=_active_context_char_limit())
 
 
 def _truncated_marker(value_type: str, size: int | None = None) -> dict[str, Any]:
@@ -547,10 +647,9 @@ def _bounded_message_preview(messages: Any) -> list[dict[str, Any]]:
     return preview
 
 
-def _audit_log_path() -> Path:
-    from hermes_constants import get_hermes_home
-
-    return get_hermes_home() / "logs" / "safety" / "session-archiver.jsonl"
+def _audit_log_path(config: Mapping[str, Any] | None = None) -> Path:
+    normalized = normalize_config(config or {})
+    return Path(str(normalized["audit_path"]))
 
 
 def _emit_memory_governance_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
@@ -567,7 +666,11 @@ def _emit_memory_governance_candidate(candidate: dict[str, Any]) -> dict[str, An
     )
 
 
-def _run_session_archiver(payload: Mapping[str, Any]) -> dict[str, Any]:
+def _run_session_archiver(
+    payload: Mapping[str, Any],
+    *,
+    config: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     verification_status, _ = _verification_status_from_payload(payload)
     incidents = payload.get("safety_results")
     incident_count = len(incidents) if isinstance(incidents, list) else 0
@@ -586,7 +689,7 @@ def _run_session_archiver(payload: Mapping[str, Any]) -> dict[str, Any]:
         "safety_results": _sanitize_value(incidents or []),
         "conversation_preview": _bounded_message_preview(payload.get("conversation_history")),
     }
-    audit_path = _audit_log_path()
+    audit_path = _audit_log_path(config)
     archive_status = "written"
     memory_candidate_status = "not_emitted"
     try:
@@ -627,88 +730,150 @@ def _run_session_archiver(payload: Mapping[str, Any]) -> dict[str, Any]:
     )
 
 
+def _apply_block_policy(
+    results: list[dict[str, Any]],
+    config: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    normalized = normalize_config(config)
+    if normalized["block_high_risk"]:
+        return results
+    adjusted: list[dict[str, Any]] = []
+    for result in results:
+        if result.get("action") == "block" and result.get("risk_level") in {"high", "critical"}:
+            metadata = dict(result.get("metadata") or {})
+            metadata["fail_open"] = True
+            metadata["block_high_risk"] = False
+            adjusted.append({**result, "action": "warn", "metadata": metadata})
+        else:
+            adjusted.append(result)
+    return adjusted
+
+
 def run_safety_checks(
     event: str,
     payload: Any,
     config: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
+    normalized_config = normalize_config(config or {})
     if not isinstance(payload, Mapping):
         return [_malformed_payload_error_result(event, payload)]
-    if event == "post_llm_call":
-        return _run_post_llm_checks(payload)
-
-    context: dict[str, Any] = {}
-    checks: list[Callable[[str, dict[str, Any], dict[str, Any]], dict[str, Any] | list[dict[str, Any]]]] = [
-        _check_identity,
-        _check_mode,
-        _check_subagent,
-        _check_local_recall,
-        _check_context_propagation,
-    ]
-    results: list[dict[str, Any]] = []
-    execution_context_error: dict[str, Any] | None = None
-    try:
-        raw_context_payload = {
-            "agent_id": payload.get("agent_id"),
-            "execution_kind": payload.get("execution_kind"),
-            "session_id": payload.get("session_id"),
-            "parent_session_id": payload.get("parent_session_id"),
-            "task_id": payload.get("task_id"),
-            "turn_id": payload.get("turn_id"),
-            "user_message": payload.get("user_message"),
-            "planning_mode": payload.get("planning_mode"),
-            "delegation_target": payload.get("delegation_target"),
-            "memory_hits": payload.get("memory_hits"),
-            "requested_path": payload.get("requested_path"),
-            "requested_paths": payload.get("requested_paths"),
-        }
-        try:
-            context = normalize_execution_context(raw_context_payload)
-        except ExecutionContextError as exc:
-            execution_context_error = _execution_context_error_result(event, payload, exc.missing_fields)
-            context = {}
-        for check in checks:
-            outcome = check(event, payload, context)
-            if isinstance(outcome, list):
-                results.extend(outcome)
-            else:
-                results.append(outcome)
-        results.extend(_check_security(event, payload, context))
-        if execution_context_error is not None:
-            results.append(execution_context_error)
-    except Exception as exc:
-        if execution_context_error is not None and not any(
-            result.get("reason_code") == "execution_context_invalid" for result in results
-        ):
-            results.append(execution_context_error)
-        results.append(
+    if not normalized_config["enabled"]:
+        return [
             make_result(
                 hook="safety-hooks",
                 event=event,
-                action="error",
-                reason_code="safety_check_error",
+                action="skip",
+                reason_code="safety_hooks_disabled",
                 risk_level="unknown",
-                message=str(exc),
-                metadata={"error_type": type(exc).__name__},
+                message="Safety hooks disabled by config.",
+                metadata={},
             )
-        )
-    return results
+        ]
+    limit_token = _ACTIVE_CONTEXT_CHAR_LIMIT.set(int(normalized_config["max_context_chars"]))
+    try:
+        if event == "post_llm_call":
+            return _apply_block_policy(_run_post_llm_checks(payload), normalized_config)
+
+        context: dict[str, Any] = {}
+        checks: list[Callable[[str, dict[str, Any], dict[str, Any]], dict[str, Any] | list[dict[str, Any]]]] = [
+            _check_identity,
+            _check_mode,
+            _check_subagent,
+            _check_local_recall,
+            _check_context_propagation,
+        ]
+        results: list[dict[str, Any]] = []
+        execution_context_error: dict[str, Any] | None = None
+        try:
+            raw_context_payload = {
+                "agent_id": payload.get("agent_id"),
+                "execution_kind": payload.get("execution_kind"),
+                "session_id": payload.get("session_id"),
+                "parent_session_id": payload.get("parent_session_id"),
+                "task_id": payload.get("task_id"),
+                "turn_id": payload.get("turn_id"),
+                "user_message": payload.get("user_message"),
+                "planning_mode": payload.get("planning_mode"),
+                "delegation_target": payload.get("delegation_target"),
+                "memory_hits": payload.get("memory_hits"),
+                "requested_path": payload.get("requested_path"),
+                "requested_paths": payload.get("requested_paths"),
+            }
+            try:
+                context = normalize_execution_context(raw_context_payload)
+            except ExecutionContextError as exc:
+                execution_context_error = _execution_context_error_result(event, payload, exc.missing_fields)
+                context = {}
+            for check in checks:
+                outcome = check(event, payload, context)
+                if isinstance(outcome, list):
+                    results.extend(outcome)
+                else:
+                    results.append(outcome)
+            results.extend(_check_security(event, payload, context))
+            if execution_context_error is not None:
+                results.append(execution_context_error)
+        except Exception as exc:
+            if execution_context_error is not None and not any(
+                result.get("reason_code") == "execution_context_invalid" for result in results
+            ):
+                results.append(execution_context_error)
+            results.append(
+                make_result(
+                    hook="safety-hooks",
+                    event=event,
+                    action="error",
+                    reason_code="safety_check_error",
+                    risk_level="unknown",
+                    message=str(exc),
+                    metadata={"error_type": type(exc).__name__},
+                )
+            )
+        return _apply_block_policy(results, normalized_config)
+    finally:
+        _ACTIVE_CONTEXT_CHAR_LIMIT.reset(limit_token)
 
 
 def build_safety_hook_overrides(
     config: dict[str, Any] | None = None,
     memory_provider: Any = None,
 ) -> dict[str, list[Callable[..., Any]]]:
+    if config is None:
+        try:
+            from hermes_cli.config import load_config
+
+            loaded = load_config() or {}
+            raw_config = ((loaded.get("agent") or {}).get("safety_hooks") or {})
+        except Exception:
+            raw_config = {}
+    else:
+        raw_config = config
+    normalized_config = normalize_config(raw_config)
+
     def _pre_llm_call(**kwargs: Any) -> list[dict[str, Any]]:
-        return run_safety_checks("pre_llm_call", kwargs, config=config)
+        return run_safety_checks("pre_llm_call", kwargs, config=normalized_config)
 
     def _post_llm_call(**kwargs: Any) -> list[dict[str, Any]]:
-        return run_safety_checks("post_llm_call", kwargs, config=config)
+        return run_safety_checks("post_llm_call", kwargs, config=normalized_config)
 
     def _on_session_end(**kwargs: Any) -> dict[str, Any]:
         if not isinstance(kwargs, Mapping):
             return _malformed_payload_error_result("on_session_end", kwargs)
-        return _run_session_archiver(kwargs)
+        if not normalized_config["enabled"]:
+            return make_result(
+                hook="session-archiver",
+                event="on_session_end",
+                action="skip",
+                reason_code="safety_hooks_disabled",
+                risk_level="unknown",
+                message="Safety hooks disabled by config.",
+                metadata={},
+            )
+        limit_token = _ACTIVE_CONTEXT_CHAR_LIMIT.set(int(normalized_config["max_context_chars"]))
+        try:
+            return _run_session_archiver(kwargs, config=normalized_config)
+        finally:
+            _ACTIVE_CONTEXT_CHAR_LIMIT.reset(limit_token)
 
     return {
         "pre_llm_call": [_pre_llm_call],
