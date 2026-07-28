@@ -199,12 +199,15 @@ def collect_l1_items(
             resolved.relative_to(Path(hermes_home).resolve())
         except Exception:
             return [], [{"reason": "security_invariant_failure", "source": name}]
-        if not path.exists():
-            continue
         try:
+            if not path.exists():
+                continue
             content = path.read_text(encoding="utf-8")
         except UnicodeError:
             diagnostics.append({"reason": "l1_encoding_error", "source": name})
+            continue
+        except OSError:
+            diagnostics.append({"reason": "l1_filesystem_error", "source": name})
             continue
         stripped = content.strip()
         if not stripped:
