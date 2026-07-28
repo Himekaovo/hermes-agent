@@ -876,7 +876,10 @@ def test_l3_intent_routing_is_deterministic_and_read_only():
     from plugins.memory.mnemosyne.injector import collect_l3_items, is_skill_intent
 
     assert is_skill_intent("which skill handles deploy?", {"deploy"}) is True
+    assert is_skill_intent("如何安装技能", set()) is True
+    assert is_skill_intent("这个工具怎么用", set()) is True
     assert is_skill_intent("remember my lunch", {"deploy"}) is False
+    assert is_skill_intent("记住我的午餐", set()) is False
 
     wiki = _FakeWiki()
     items, diagnostics = collect_l3_items(
@@ -905,6 +908,39 @@ def test_l3_filters_inactive_skills_and_lowers_incomplete_provenance_trust():
     assert diagnostics == []
     assert [item.item_id for item in items] == ["L3:github:acme/partial:"]
     assert items[0].trust < 1.0
+
+
+class _MalformedRowRetriever:
+    def search(self, query, *, min_trust=0.3, limit=8, mark_retrieved=True, **kwargs):
+        return [
+            {
+                "fact_id": 8,
+                "content": "Valid deployment memory.",
+                "score": 0.7,
+                "trust_score": 0.9,
+                "reason": {"summary": "matched deployment"},
+            },
+            {
+                "fact_id": 9,
+                "content": "Malformed deployment memory.",
+                "score": None,
+                "trust_score": None,
+                "reason": {"summary": "matched malformed row"},
+            },
+        ]
+
+
+def test_l2_adapter_skips_malformed_rows_with_diagnostic():
+    from plugins.memory.mnemosyne.injector import collect_l2_items
+
+    items, diagnostics = collect_l2_items(_MalformedRowRetriever(), "deployment")
+
+    assert [item.item_id for item in items] == ["L2:fact:8"]
+    assert diagnostics == [{
+        "reason": "l2_row_invalid",
+        "layer": "L2",
+        "fact_id": 9,
+    }]
 
 
 def test_l4_records_skip_malformed_source_refs_without_dropping_valid_refs():
