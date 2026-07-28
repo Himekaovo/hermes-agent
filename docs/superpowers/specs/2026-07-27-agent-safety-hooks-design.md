@@ -90,30 +90,33 @@ global plugins → built-in safety hooks → instance override hooks
 
 ### Post-LLM: egress gate
 
-7. **response-and-action-auditor**
-   - 检查 assistant response、工具调用轨迹、导入路径、文件写入目标和外泄模式；
-   - 对危险路径、未经批准的写入或敏感信息输出返回结构化阻断结果；
-   - 不把失败响应伪装成成功，不自动重试模型调用。
+7. **egress-inspector**
+   - 检查原始 assistant response、工具调用轨迹、导入路径、文件写入目标和外泄模式；
+   - 在通用后处理前执行，避免格式化绕过敏感信息检查；
+   - 对危险路径、未经批准的写入或敏感信息输出返回结构化阻断结果。
+
+8. **verification-gate**
+   - 只接受结构化工具事件、明确的退出码和可信测试结果；
+   - 状态严格区分 `passed`、`failed`、`not_run` 和 `unavailable`；
+   - 不把文本中的“tests passed”或 Hook 自身异常当作验证通过。
+
+9. **a2a-metadata-processor**
+   - 检查 Agent/Subagent/A2A 关联的 parent、child、session 和 task metadata；
+   - 拒绝缺失或越权的结构化关联，不从 prompt 文本推断执行环境；
+   - 不把 Subagent 中间推理自动写入主 Agent 的长期记忆。
+
+10. **generic-postprocessor**
+    - 对已经通过 egress 检查的结果执行有界格式化、状态归一化和审计字段补齐；
+    - 不删除原始安全检查结果，不把 `BLOCK` 或 `ERROR` 改成 `ALLOW`；
+    - 不自动重试模型调用。
 
 ### Session end: archival gate
 
-8. **session-summary**
-   - 生成有界的会话摘要和安全状态，不保存完整 secret 或原始凭证；
-   - 只使用当前 session 的消息快照。
-
-9. **incident-journal**
-   - 记录阻断、异常、工具失败和恢复事件；
-   - 记录 reason code、风险级别、session/task/turn 标识和时间；
-   - 日志写入失败不得阻断 session cleanup。
-
-10. **memory-commit-guard**
-    - 在会话结束前检查待提交的学习或记忆变更是否经过 Memory Governance；
-    - 未经过 governance 的候选只报告，不直接写入；
-    - 不自动批准、合并、删除或回滚记忆。
-
-11. **session-cleanup**
-    - 清理 session-local Hook 状态、临时文件和 spill 记录；
-    - 通过 `finally` 和现有生命周期调用保证异常时也执行；
+11. **session-archiver**
+    - 生成有界会话摘要，记录阻断、异常、工具失败、恢复事件和安全状态；
+    - 记忆路径只允许读取和生成候选，只有 Memory Governance 校验通过后才能持久化；
+    - 未完成任务、阻断响应和 Subagent 中间结果不得自动写入主 Agent 长期记忆；
+    - 归档写入失败不得阻断 cleanup，且 cleanup 必须在 `finally` 中清理 session-local Hook 状态、临时文件和 spill 记录；
     - 不清理用户明确保留的版本快照或 provenance 数据。
 
 ## Result Contract
@@ -124,7 +127,7 @@ global plugins → built-in safety hooks → instance override hooks
 {
     "hook": "security-inspector",
     "event": "pre_llm_call",
-    "action": "allow",  # allow | warn | block | skip
+    "action": "allow",  # allow | warn | block | error | skip
     "reason_code": "prompt_injection_detected",
     "risk_level": "high",  # low | medium | high
     "message": "Human-readable explanation",
@@ -132,18 +135,62 @@ global plugins → built-in safety hooks → instance override hooks
         "session_id": "...",
         "task_id": "...",
         "turn_id": "...",
+        "agent_id": "...",
+        "execution_kind": "interactive",
+        "parent_session_id": None,
     },
 }
 ```
 
 结果必须 JSON-serializable。`message` 不得包含未经脱敏的 token、密码、完整环境变量或原始秘密内容。
 
-阶段行为：
+### Dispatcher contract
 
-- `pre_llm_call` 的 `block` 阻止当前模型调用，并返回可解释错误；
-- `post_llm_call` 的 `block` 阻止危险响应进入用户可见输出，但保留审计记录；
-- `on_session_end` 的任何 Hook 结果都不能阻止清理流程；
+所有职责的异常策略由调度器统一处理，不由单个 Hook 自行解释：
+
+```text
+明确识别到高风险 → BLOCK
+Hook 正常完成且无风险 → ALLOW / WARN
+Hook 抛异常、超时、畸形输入或无法判断 → ERROR，然后按该阶段默认策略继续
+```
+
+`BLOCK` 与 `ERROR` 永远是两个不同控制流：安全检查器抛异常不能自动变成阻断，安全检查器明确返回 `BLOCK` 也不能被 fail-open 吞掉。
+
+调度器的默认策略是：
+
+- `pre_llm_call`：`BLOCK` 短路模型调用；`ERROR` 记录后继续；
+- `post_llm_call`：`BLOCK` 阻断用户可见响应；`ERROR` 保留原始安全响应并记录；
+- `on_session_end`：任何结果都不能阻止归档和 cleanup。
+
+### Structured execution context
+
+每个 Hook payload 必须带有或明确标记以下字段：
+
+```python
+{
+    "agent_id": "...",
+    "execution_kind": "interactive" | "cron" | "subagent",
+    "parent_session_id": "..." | None,
+    "session_id": "...",
+    "task_id": "...",
+    "turn_id": "...",
+}
+```
+
+执行环境只能由这些可信字段决定，不能从 prompt 文本推断。Cron 不继承交互会话临时 context；Subagent 只继承显式复制的 callback 和显式允许的 context；不同 Agent 的 Hook 状态、缓存、审计和失败记录不能共享可变全局对象。
+
+阶段顺序与行为：
+
+- `pre_llm_call` 固定顺序为 `identity → mode → delegation/context → recall → security`，其中 `BLOCK` 阻止当前模型调用；
+- `post_llm_call` 固定顺序为 `egress → verification → A2A metadata → generic postprocessing`，其中 egress 针对原始输出执行；
+- `on_session_end` 只有 `session-archiver`，任何结果都不能阻止清理流程；
 - 单个 callback 异常由现有 Hook 隔离逻辑捕获，并降级为 warning。
+
+记忆边界固定为：
+
+- pre：Wiki/memory recall 只读；
+- post：只生成候选和审计结果，不直接写记忆；
+- session-end：先经过 Memory Governance 的敏感性、去重、信任度、分类和标签检查，再允许唯一持久化入口执行。
 
 ## Configuration
 

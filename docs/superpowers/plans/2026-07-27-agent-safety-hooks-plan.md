@@ -14,7 +14,12 @@
 - Preserve global Hook callbacks and the existing `telemetry_schema_version` payload contract.
 - Built-in safety callbacks are instance-scoped and must not mutate the process-wide PluginManager registry.
 - High-risk explicit violations may block; ordinary callback failures fail open; session cleanup never blocks.
+- The dispatcher uses distinct `ALLOW`, `BLOCK`, and `ERROR` outcomes; Hook exceptions, timeouts, malformed input, and inability to decide are `ERROR`, not `BLOCK`.
+- Trusted execution context includes `agent_id`, `execution_kind` (`interactive`, `cron`, or `subagent`), `parent_session_id`, `session_id`, `task_id`, and `turn_id`; execution kind is never inferred from prompt text.
 - Memory writes remain governed by Memory Governance; safety hooks never write memory or Skill files directly.
+- Pre hooks only read memory/SkillWiki; post hooks only produce candidates and audit results; session-end persistence is the only path that may submit a candidate to Memory Governance.
+- Hook order is explicit: pre `identity -> mode -> delegation/context -> recall -> security`; post `egress -> verification -> A2A metadata -> generic postprocessing`; session-end `session-archiver`.
+- Verification states are `passed`, `failed`, `not_run`, and `unavailable`; text claims such as `tests passed` are not verification evidence.
 - Do not add runtime dependencies or change Memory Provider public APIs.
 - Keep `.superpowers/` untracked and out of every commit.
 
@@ -27,7 +32,8 @@
 - Create: `tests/agent/test_safety_hooks.py`
 
 **Interfaces:**
-- Produces `SafetyResult` as a JSON-serializable mapping with `hook`, `event`, `action`, `reason_code`, `risk_level`, `message`, and sanitized `metadata`.
+- Produces `SafetyResult` as a JSON-serializable mapping with `hook`, `event`, `action`, `reason_code`, `risk_level`, `message`, and sanitized `metadata`; `action` is one of `allow`, `warn`, `block`, `error`, or `skip`.
+- Produces `normalize_execution_context(payload) -> dict[str, Any]` and rejects missing `agent_id`, `execution_kind`, or `session_id` as an `ERROR` result.
 - Produces `run_safety_checks(event, payload, config=None) -> list[dict[str, Any]]`.
 - Produces `build_safety_hook_overrides(config=None, memory_provider=None) -> dict[str, list[Callable[..., Any]]]` for later Tasks 2-4.
 
@@ -70,7 +76,7 @@ Expected: FAIL because `agent.safety_hooks` does not exist yet.
 
 - [ ] **Step 3: Implement the minimal result and redaction primitives**
 
-Implement `make_result()` with fixed action/risk enums, recursively sanitize metadata strings, replace token/password/key-like values with `[REDACTED]`, and implement `bounded_context()` with deterministic truncation.
+Implement `make_result()` with fixed action/risk enums, recursively sanitize metadata strings, replace token/password/key-like values with `[REDACTED]`, implement `bounded_context()` with deterministic truncation, and implement `normalize_execution_context()` using only structured fields.
 
 - [ ] **Step 4: Add failing tests for identity, context, path, injection, and secret checks**
 
@@ -113,7 +119,7 @@ Expected: FAIL only on the newly specified safety behaviors.
 
 - [ ] **Step 6: Implement the deterministic checks and hook factories**
 
-Implement the six pre-LLM responsibilities as private check functions: identity, PM mode, subagent checklist, local recall, context propagation, and security inspection. `run_safety_checks()` must return stable ordering: identity, mode, delegation, recall, propagation, security, then event-specific checks.
+Implement the six pre-LLM responsibilities as private check functions: identity, PM mode, subagent checklist, local recall, context propagation, and security inspection. `run_safety_checks()` must return stable ordering: identity, mode, delegation/context, recall, propagation, security. A raised exception becomes one `error` result and does not become `block`; only an explicit high-risk result returns `block`.
 
 - [ ] **Step 7: Run Task 1 tests and commit**
 
@@ -234,9 +240,10 @@ git commit -m "feat: enforce pre-llm safety hooks"
 - Test: `tests/agent/test_safety_hooks.py`
 
 **Interfaces:**
-- Post-LLM callbacks return `response-and-action-auditor` results.
+- Post-LLM callbacks return four ordered result groups: `egress-inspector`, `verification-gate`, `a2a-metadata-processor`, and `generic-postprocessor`.
 - A post result with `action == "block"` replaces the user-visible response with a safe error and sets `safety_blocked=True`; it never retries the model.
-- Session-end callbacks write only sanitized, bounded JSONL audit records and cannot stop cleanup.
+- Verification results use only `passed`, `failed`, `not_run`, and `unavailable`; a textual claim is never promoted to `passed`.
+- The single session-end `session-archiver` writes sanitized, bounded JSONL audit records and can submit a memory candidate to Memory Governance, but cannot bypass it or stop cleanup.
 
 - [ ] **Step 1: Write failing tests for post-LLM block and cleanup-after-error**
 
@@ -279,6 +286,23 @@ def test_session_end_callbacks_are_fail_open():
             results.append(result)
 
     assert isinstance(results, list)
+
+
+def test_verification_gate_distinguishes_unavailable_from_passed():
+    from agent.safety_hooks import run_safety_checks
+
+    results = run_safety_checks(
+        "post_llm_call",
+        {
+            "session_id": "s1",
+            "task_id": "t1",
+            "turn_id": "u1",
+            "verification": None,
+        },
+    )
+
+    verification = next(r for r in results if r["hook"] == "verification-gate")
+    assert verification["metadata"]["verification_status"] == "unavailable"
 ```
 
 - [ ] **Step 2: Run and verify the expected failures**
@@ -295,9 +319,9 @@ Expected: FAIL because finalizer does not interpret safety results yet.
 
 Capture `post_llm_call` return values in `turn_finalizer.py`, identify block results, redact the outgoing response, attach `safety_results`, and preserve the existing transform and memory-sync ordering.
 
-- [ ] **Step 4: Implement four session-end responsibilities**
+- [ ] **Step 4: Implement the single session-end archiver**
 
-Add bounded session summary, incident journal, memory commit guard, and cleanup callbacks. Use a per-profile JSONL audit path, a process-local lock for writes, append-only malformed-line preservation, and `finally` cleanup. The memory commit guard may report `governance_missing` but must not write memory.
+Add the single `session-archiver` callback. It generates a bounded summary, records incidents and verification status, checks memory candidates through Memory Governance, writes only sanitized per-profile JSONL audit records, preserves malformed lines, and performs cleanup in `finally`. It may report `governance_missing` but must not write memory directly.
 
 - [ ] **Step 5: Run focused tests and commit**
 
@@ -325,9 +349,9 @@ git commit -m "feat: audit llm output and session lifecycle"
 - Test: `tests/cron/test_instance_hook_overrides.py`
 
 **Interfaces:**
-- Child Agents receive copied safety and explicit callback lists.
+- Child Agents receive copied safety and explicit callback lists plus explicit `execution_kind="subagent"` and `parent_session_id`.
 - Parent and child cannot mutate one another's callback mappings.
-- Cron builds job-local safety callbacks without mutating global Hook registration.
+- Cron builds job-local safety callbacks with `execution_kind="cron"` without mutating global Hook registration or inheriting interactive context.
 
 - [ ] **Step 1: Add failing isolation tests**
 
@@ -357,7 +381,7 @@ Expected: FAIL only where the new safety callbacks are not included in the child
 
 - [ ] **Step 3: Implement copied inheritance and job-local construction**
 
-Reuse `_clone_hook_overrides()` and `build_instance_hooks()`; ensure safety callback factories receive the child/job profile and never call global `register_hook()`.
+Reuse `_clone_hook_overrides()` and `build_instance_hooks()`; ensure safety callback factories receive the child/job profile and never call global `register_hook()`. The child gets only explicitly allowed context, does not default to the parent's complete memory, and its session-end archive is tagged as subagent-only.
 
 - [ ] **Step 4: Run regression tests and commit**
 
@@ -454,6 +478,8 @@ pytest tests/agent/test_safety_hooks.py \
 ```
 
 Expected: all focused safety and isolation tests pass.
+
+The focused suite must include four layers: single-hook unit tests, dispatcher tests for order and `BLOCK` versus `ERROR`, lifecycle integration tests for pre → LLM → post → session-end, and isolation/regression tests for Agent/Cron/Subagent and memory writes.
 
 - [ ] **Step 2: Run related regressions**
 
