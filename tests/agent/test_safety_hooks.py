@@ -239,3 +239,20 @@ def test_run_safety_checks_preserves_parent_session_id_for_subagent_payload():
     assert context_result["action"] == "allow"
 
     assert all(r["reason_code"] != "execution_context_invalid" for r in results)
+
+
+def test_run_safety_checks_preserves_earlier_results_when_later_checker_raises(monkeypatch):
+    import agent.safety_hooks as safety_hooks
+
+    def boom(event: str, payload: dict[str, object], context: dict[str, object]) -> list[dict[str, object]]:
+        raise RuntimeError("security boom")
+
+    monkeypatch.setattr(safety_hooks, "_check_security", boom)
+
+    results = safety_hooks.run_safety_checks("pre_llm_call", {"user_message": "hello"})
+
+    assert any(r["reason_code"] == "identity_missing" and r["action"] == "block" for r in results)
+    assert any(
+        r["reason_code"] == "safety_check_error" and r["action"] == "error"
+        for r in results
+    )

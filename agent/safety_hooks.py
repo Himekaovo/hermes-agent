@@ -391,7 +391,7 @@ def run_safety_checks(
                 results.append(execution_context_error)
         results.extend(_check_security(event, payload, context))
     except Exception as exc:
-        return [
+        results.append(
             make_result(
                 hook="safety-hooks",
                 event=event,
@@ -401,7 +401,7 @@ def run_safety_checks(
                 message=str(exc),
                 metadata={"error_type": type(exc).__name__},
             )
-        ]
+        )
     return results
 
 
