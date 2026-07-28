@@ -28,6 +28,9 @@ from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.message_content import flatten_message_text
 
 
+_ALLOWED_VERIFICATION_STATUSES = frozenset({"passed", "failed", "not_run", "unavailable"})
+
+
 def _execution_kind_for(agent) -> str:
     if getattr(agent, "_parent_session_id", None):
         return "subagent"
@@ -53,6 +56,43 @@ def _replace_visible_assistant_response(messages: list[dict], response_text: str
             message.pop("_db_persisted", None)
             return
     messages.append({"role": "assistant", "content": response_text})
+
+
+def _verification_payload_from_results(results) -> dict[str, str] | None:
+    for result in results or []:
+        if not isinstance(result, dict) or result.get("hook") != "verification-gate":
+            continue
+        metadata = result.get("metadata")
+        if not isinstance(metadata, dict):
+            continue
+        status = str(metadata.get("verification_status") or "").strip().lower()
+        if status in _ALLOWED_VERIFICATION_STATUSES:
+            return {"status": status}
+    return None
+
+
+def _prepare_messages_for_final_persist(agent, messages: list[dict], final_response, interrupted) -> None:
+    agent._drop_trailing_empty_response_scaffolding(messages)
+
+    if interrupted:
+        from agent.message_sanitization import close_interrupted_tool_sequence
+        close_interrupted_tool_sequence(messages, final_response)
+
+    if final_response and not interrupted:
+        try:
+            _tail = messages[-1] if messages else None
+        except Exception:
+            _tail = None
+        _tail_role = _tail.get("role") if isinstance(_tail, dict) else None
+        if _tail_role != "assistant":
+            messages.append({"role": "assistant", "content": final_response})
+        elif isinstance(_tail, dict) and _is_pure_tool_call_tail(_tail):
+            _tail["content"] = final_response
+            _tail.pop("_db_persisted", None)
+
+    _apply_override = getattr(agent, "_apply_persist_user_message_override", None)
+    if callable(_apply_override):
+        _apply_override(messages)
 
 
 def _is_pure_tool_call_tail(msg: dict) -> bool:
@@ -226,128 +266,6 @@ def finalize_turn(
         _cleanup_errors.append(f"cleanup_task_resources: {_cleanup_err}")
         logger.error("finalize_turn: _cleanup_task_resources failed: %s", _cleanup_err, exc_info=True)
 
-    # Persist session to both JSON log and SQLite only after private retry
-    # scaffolding has been removed. Otherwise a later user "continue" turn
-    # can replay assistant("(empty)") / recovery nudges and fall into the
-    # same empty-response loop again.
-    try:
-        agent._drop_trailing_empty_response_scaffolding(messages)
-
-        # When the turn was interrupted and the last message is a tool
-        # result, append a synthetic assistant message to close the
-        # tool-call sequence. Without this, the session persists a
-        # ``tool → user`` alternation that strict providers (Gemini,
-        # Claude) reject, causing them to hallucinate a continuation of
-        # the user's message on the next turn (#48879).
-        #
-        # ``_drop_trailing_empty_response_scaffolding`` only rewinds the
-        # tool tail when an empty-response scaffolding flag is present; a
-        # clean ``/stop`` interrupt after a successful tool sets no such
-        # flag, so the tool result survives as the tail and we close it
-        # here instead. On an interrupt ``final_response`` is typically
-        # empty, so fall back to an explicit placeholder rather than
-        # persisting an empty-content assistant turn.
-        if interrupted:
-            from agent.message_sanitization import close_interrupted_tool_sequence
-            close_interrupted_tool_sequence(messages, final_response)
-
-        # Some recovery/fallback paths return a real final_response without
-        # adding a closing assistant message to the transcript (e.g. the
-        # partial-stream and prior-turn-content recovery ``break`` sites in
-        # ``conversation_loop``). If persisted as-is, the durable session can
-        # end at a tool/user message even though the caller — and the gateway
-        # platform — already saw a completed assistant response. The next turn
-        # then replays a user-only backlog and the model re-answers every
-        # "unanswered" message. Close the durable turn at the source, at the
-        # single chokepoint every recovery ``break`` flows through, so the
-        # invariant "delivered final_response ⇒ assistant row in transcript"
-        # holds regardless of which path produced it. (#43849 / #44100)
-        if final_response and not interrupted:
-            try:
-                _tail = messages[-1] if messages else None
-            except Exception:
-                _tail = None
-            _tail_role = _tail.get("role") if isinstance(_tail, dict) else None
-            if _tail_role != "assistant":
-                messages.append({"role": "assistant", "content": final_response})
-            elif isinstance(_tail, dict) and _is_pure_tool_call_tail(_tail):
-                # The tail IS an assistant row, but a *pure tool-call turn*:
-                # tool_calls with no text of its own. The role check alone
-                # leaves the #43849/#44100 invariant unmet — the user saw a
-                # response that never reached the transcript, and the next turn
-                # replays the user backlog and re-answers it (the very symptom
-                # this block was added for). Fill that row's empty content
-                # instead of appending, so the durable turn ends with the answer
-                # without disturbing the tool-call structure or creating an
-                # assistant→assistant pair.
-                _tail["content"] = final_response
-                # The row may have already been flushed to SQLite by the
-                # incremental tool-call persist (conversation_loop.py:4990),
-                # which stamps ``_DB_PERSISTED_MARKER`` so subsequent flushes
-                # skip it. Pop the marker so the next ``_persist_session``
-                # re-writes the filled content to the durable store —
-                # otherwise ``/resume`` reloads ``content=""`` and the bug
-                # resurfaces cross-session.
-                _tail.pop("_db_persisted", None)
-
-        # The model has completed its request, so replace API-local
-        # voice/model/skill guidance with the clean user input before writing the
-        # final durable snapshot and returning the continuation history. Earlier
-        # turn-start flushes use the DB-only override because their messages are
-        # still needed for the API request; this finalizer runs after that request
-        # is complete (#48677 / #63766).
-        _apply_override = getattr(agent, "_apply_persist_user_message_override", None)
-        if callable(_apply_override):
-            _apply_override(messages)
-        agent._persist_session(messages, conversation_history)
-    except Exception as _persist_err:
-        _cleanup_errors.append(f"persist_session: {_persist_err}")
-        logger.error("finalize_turn: _persist_session failed: %s", _persist_err, exc_info=True)
-
-    # ── Turn-exit diagnostic log ─────────────────────────────────────
-    # Always logged at INFO so agent.log captures WHY every turn ended.
-    # When the last message is a tool result (agent was mid-work), log
-    # at WARNING — this is the "just stops" scenario users report.
-    _last_msg_role = messages[-1].get("role") if messages else None
-    _last_tool_name = None
-    if _last_msg_role == "tool":
-        # Walk back to find the assistant message with the tool call
-        for _m in reversed(messages):
-            if _m.get("role") == "assistant" and _m.get("tool_calls"):
-                _tcs = _m["tool_calls"]
-                if _tcs and isinstance(_tcs[0], dict):
-                    _last_tool_name = _tcs[-1].get("function", {}).get("name")
-                break
-
-    _turn_tool_count = sum(
-        1 for m in messages
-        if isinstance(m, dict) and m.get("role") == "assistant" and m.get("tool_calls")
-    )
-    _resp_len = len(final_response) if final_response else 0
-    _budget_used = agent.iteration_budget.used if agent.iteration_budget else 0
-    _budget_max = agent.iteration_budget.max_total if agent.iteration_budget else 0
-
-    _diag_msg = (
-        "Turn ended: reason=%s model=%s api_calls=%d/%d budget=%d/%d "
-        "tool_turns=%d last_msg_role=%s response_len=%d session=%s"
-    )
-    _diag_args = (
-        _turn_exit_reason, agent.model, api_call_count, agent.max_iterations,
-        _budget_used, _budget_max,
-        _turn_tool_count, _last_msg_role, _resp_len,
-        agent.session_id or "none",
-    )
-
-    if _last_msg_role == "tool" and not interrupted:
-        # Agent was mid-work — this is the "just stops" case.
-        logger.warning(
-            "Turn ended with pending tool result (agent may appear stuck). "
-            + _diag_msg + " last_tool=%s",
-            *_diag_args, _last_tool_name,
-        )
-    else:
-        logger.info(_diag_msg, *_diag_args)
-
     # File-mutation verifier footer.
     # If one or more ``write_file`` / ``patch`` calls failed during this
     # turn and were never superseded by a successful write to the same
@@ -457,6 +375,7 @@ def finalize_turn(
 
     _safety_results: list[dict] = []
     _safety_blocked = False
+    _verification = None
 
     # Plugin hook: post_llm_call
     # Fired once per turn after the tool-calling loop completes.
@@ -482,6 +401,7 @@ def finalize_turn(
                 platform=getattr(agent, "platform", None) or "",
             )
             _safety_results = _flatten_hook_results(_post_results)
+            _verification = _verification_payload_from_results(_safety_results)
             _blocking_result = next(
                 (
                     result for result in _safety_results
@@ -498,17 +418,62 @@ def finalize_turn(
                 completed = False
                 _turn_exit_reason = "safety_blocked"
                 _replace_visible_assistant_response(messages, final_response)
-                try:
-                    agent._persist_session(messages, conversation_history)
-                except Exception as _persist_err:
-                    _cleanup_errors.append(f"persist_session_post_safety: {_persist_err}")
-                    logger.error(
-                        "finalize_turn: post-safety _persist_session failed: %s",
-                        _persist_err,
-                        exc_info=True,
-                    )
         except Exception as exc:
             logger.warning("post_llm_call hook failed: %s", exc)
+
+    # Persist session to both JSON log and SQLite only after private retry
+    # scaffolding has been removed and post-LLM safety checks have had a
+    # chance to replace the visible response. Otherwise append-only durable
+    # storage can capture the raw blocked response before the safe
+    # replacement lands.
+    try:
+        _prepare_messages_for_final_persist(agent, messages, final_response, interrupted)
+        agent._persist_session(messages, conversation_history)
+    except Exception as _persist_err:
+        _cleanup_errors.append(f"persist_session: {_persist_err}")
+        logger.error("finalize_turn: _persist_session failed: %s", _persist_err, exc_info=True)
+
+    # ── Turn-exit diagnostic log ─────────────────────────────────────
+    # Always logged at INFO so agent.log captures WHY every turn ended.
+    # When the last message is a tool result (agent was mid-work), log
+    # at WARNING — this is the "just stops" scenario users report.
+    _last_msg_role = messages[-1].get("role") if messages else None
+    _last_tool_name = None
+    if _last_msg_role == "tool":
+        for _m in reversed(messages):
+            if _m.get("role") == "assistant" and _m.get("tool_calls"):
+                _tcs = _m["tool_calls"]
+                if _tcs and isinstance(_tcs[0], dict):
+                    _last_tool_name = _tcs[-1].get("function", {}).get("name")
+                break
+
+    _turn_tool_count = sum(
+        1 for m in messages
+        if isinstance(m, dict) and m.get("role") == "assistant" and m.get("tool_calls")
+    )
+    _resp_len = len(final_response) if final_response else 0
+    _budget_used = agent.iteration_budget.used if agent.iteration_budget else 0
+    _budget_max = agent.iteration_budget.max_total if agent.iteration_budget else 0
+
+    _diag_msg = (
+        "Turn ended: reason=%s model=%s api_calls=%d/%d budget=%d/%d "
+        "tool_turns=%d last_msg_role=%s response_len=%d session=%s"
+    )
+    _diag_args = (
+        _turn_exit_reason, agent.model, api_call_count, agent.max_iterations,
+        _budget_used, _budget_max,
+        _turn_tool_count, _last_msg_role, _resp_len,
+        agent.session_id or "none",
+    )
+
+    if _last_msg_role == "tool" and not interrupted:
+        logger.warning(
+            "Turn ended with pending tool result (agent may appear stuck). "
+            + _diag_msg + " last_tool=%s",
+            *_diag_args, _last_tool_name,
+        )
+    else:
+        logger.info(_diag_msg, *_diag_args)
 
     # Extract reasoning from the CURRENT turn only.  Walk backwards
     # but stop at the user message that started this turn — anything
@@ -643,7 +608,7 @@ def finalize_turn(
             interrupted=interrupted,
             safety_blocked=_safety_blocked,
             safety_results=_safety_results,
-            verification=None,
+            verification=_verification,
             conversation_history=list(messages),
             model=agent.model,
             platform=getattr(agent, "platform", None) or "",

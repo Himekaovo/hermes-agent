@@ -454,3 +454,30 @@ def test_session_end_archiver_is_fail_open_and_governance_bounded(tmp_path, monk
     assert result["hook"] == "session-archiver"
     assert result["metadata"]["memory_candidate_status"] != "written"
     assert "sk-test-secret" not in repr(result)
+
+
+@pytest.mark.parametrize("verification_status", ["failed", "unavailable"])
+def test_session_end_archiver_preserves_structured_verification_status(
+    tmp_path, monkeypatch, verification_status
+):
+    import agent.safety_hooks as safety_hooks
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    callback = safety_hooks.build_safety_hook_overrides()["on_session_end"][0]
+
+    result = callback(
+        agent_id="agent-1",
+        execution_kind="interactive",
+        session_id="s1",
+        task_id="t1",
+        turn_id="u1",
+        completed=True,
+        interrupted=False,
+        verification={"status": verification_status},
+        conversation_history=[
+            {"role": "user", "content": "check status"},
+            {"role": "assistant", "content": "Done."},
+        ],
+    )
+
+    assert result["metadata"]["verification_status"] == verification_status

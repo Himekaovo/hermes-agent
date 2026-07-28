@@ -6,6 +6,8 @@ import types
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 sys.modules.setdefault("fire", types.SimpleNamespace(Fire=lambda *a, **k: None))
 sys.modules.setdefault("firecrawl", types.SimpleNamespace(Firecrawl=object))
 sys.modules.setdefault("fal_client", types.SimpleNamespace())
@@ -239,6 +241,66 @@ def test_post_llm_block_replaces_user_visible_response_without_retry(monkeypatch
     assert result["messages"][-1]["role"] == "assistant"
     assert "sk-test-secret" not in json.dumps(result["messages"][-1])
     assert agent.persist_calls[-1][-1]["content"] == result["final_response"]
+
+
+def test_post_llm_block_never_persists_raw_secret_when_egress_blocks(monkeypatch):
+    import agent.safety_hooks as safety_hooks
+
+    def fake_invoke_hook(name, **kwargs):
+        if name == "transform_llm_output":
+            return []
+        if name == "post_llm_call":
+            return [safety_hooks.run_safety_checks(name, kwargs)]
+        if name == "on_session_end":
+            callback = safety_hooks.build_safety_hook_overrides()["on_session_end"][0]
+            return [callback(**kwargs)]
+        return []
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", fake_invoke_hook)
+    agent = _FinalizerAgent()
+
+    result = _finalize(agent, final_response="my api key is sk-test-secret")
+
+    assert result["safety_blocked"] is True
+    assert len(agent.persist_calls) == 1
+    assert all(
+        "sk-test-secret" not in json.dumps(persisted_messages)
+        for persisted_messages in agent.persist_calls
+    )
+
+
+@pytest.mark.parametrize("verification_status", ["failed", "unavailable"])
+def test_finalize_turn_passes_structured_verification_status_to_session_archiver(
+    monkeypatch, verification_status
+):
+    captured: dict[str, object] = {}
+
+    def fake_invoke_hook(name, **kwargs):
+        if name == "transform_llm_output":
+            return []
+        if name == "post_llm_call":
+            return [[
+                {
+                    "hook": "verification-gate",
+                    "event": "post_llm_call",
+                    "action": "skip",
+                    "reason_code": f"verification_{verification_status}",
+                    "risk_level": "unknown",
+                    "message": "Verification status recorded.",
+                    "metadata": {"verification_status": verification_status},
+                }
+            ]]
+        if name == "on_session_end":
+            captured["verification"] = kwargs.get("verification")
+            return []
+        return []
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", fake_invoke_hook)
+    agent = _FinalizerAgent()
+
+    _finalize(agent, final_response="All done.")
+
+    assert captured["verification"] == {"status": verification_status}
 
 
 def test_finalize_turn_runs_session_archiver_fail_open(monkeypatch, tmp_path):
