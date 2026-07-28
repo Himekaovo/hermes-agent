@@ -161,3 +161,49 @@ GREEN: after the write-boundary re-sanitization:
 
 `./.venv/bin/python -m py_compile plugins/memory/mnemosyne/l4_store.py` and
 `git diff --check` completed successfully.
+
+## Critical Re-review Fixes
+
+- `_canonical_payload` is now immutable canonical JSON text rather than a mutable
+  dict. `_persistence_payload()` reconstructs a clean dict from that snapshot,
+  strips every read-time field, enforces `parent_session_id: str | None`, and
+  rejects a snapshot whose computed candidate ID differs from `record.record_id`.
+- `write_candidate()` validates both the caller-visible payload profile and the
+  canonical persistence profile against the store profile before a record can be
+  written.
+
+## Critical Re-review RED/GREEN Evidence
+
+RED: the requested focused regressions were added before the production change:
+
+```text
+./.venv/bin/python -m pytest -q \
+  tests/plugins/memory/test_mnemosyne.py::test_l4_write_rejects_canonical_profile_mismatch_after_public_profile_mutation \
+  tests/plugins/memory/test_mnemosyne.py::test_l4_canonical_payload_cannot_be_mutated_to_create_stale_id_persistence
+
+2 failed in 0.09s
+```
+
+The first test showed a record constructed for `other-profile` could mutate its
+public profile to `coder` and be written to coder's L4 file. The second showed
+that `_canonical_payload` accepted mutation.
+
+GREEN: after making the snapshot immutable and validating the persistence
+boundary:
+
+```text
+./.venv/bin/python -m pytest -q \
+  tests/plugins/memory/test_mnemosyne.py::test_l4_write_rejects_canonical_profile_mismatch_after_public_profile_mutation \
+  tests/plugins/memory/test_mnemosyne.py::test_l4_canonical_payload_cannot_be_mutated_to_create_stale_id_persistence
+
+2 passed in 0.06s
+```
+
+```text
+./.venv/bin/python -m pytest -q tests/plugins/memory/test_mnemosyne.py
+
+19 passed in 0.08s
+```
+
+`./.venv/bin/python -m py_compile plugins/memory/mnemosyne/l4_store.py` and
+`git diff --check` completed successfully.

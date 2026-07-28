@@ -321,6 +321,36 @@ def test_l4_write_rejects_mutated_profile_id(tmp_path):
         store.write_candidate(record)
 
 
+def test_l4_write_rejects_canonical_profile_mismatch_after_public_profile_mutation(tmp_path):
+    from plugins.memory.mnemosyne.contracts import MnemosyneConfig
+    from plugins.memory.mnemosyne.l4_store import L4CandidateRecord, L4Store
+
+    store = L4Store(tmp_path, profile_id="coder", config=MnemosyneConfig.from_mapping({}))
+    record = L4CandidateRecord.from_mapping(_l4_record(profile_id="other-profile"))
+    record.payload["profile_id"] = "coder"
+
+    with pytest.raises(ValueError, match="profile_id"):
+        store.write_candidate(record)
+
+    assert not store.path.exists()
+
+
+def test_l4_canonical_payload_cannot_be_mutated_to_create_stale_id_persistence(tmp_path):
+    from plugins.memory.mnemosyne.contracts import MnemosyneConfig
+    from plugins.memory.mnemosyne.l4_store import L4CandidateRecord, L4Store
+
+    store = L4Store(tmp_path, profile_id="coder", config=MnemosyneConfig.from_mapping({}))
+    record = L4CandidateRecord.from_mapping(_l4_record())
+
+    with pytest.raises(TypeError):
+        record._canonical_payload["content"] = "A stale-ID mutation."
+
+    assert store.write_candidate(record)["written"] is True
+    persisted = json.loads(store.path.read_text(encoding="utf-8"))
+    assert persisted["record_id"] == record.record_id
+    assert persisted["content"] == _l4_record()["content"]
+
+
 def test_l4_read_strips_all_legacy_derived_fields(tmp_path):
     from plugins.memory.mnemosyne.contracts import MnemosyneConfig
     from plugins.memory.mnemosyne.l4_store import L4Store
