@@ -760,6 +760,153 @@ def test_l4_records_convert_to_items_with_read_time_reason():
     )
 
 
+class _FakeRetriever:
+    def __init__(self):
+        self.calls = []
+
+    def search(self, query, *, min_trust=0.3, limit=8, mark_retrieved=True, **kwargs):
+        self.calls.append(("search", query, min_trust, limit, mark_retrieved, kwargs))
+        return [{
+            "fact_id": 7,
+            "content": "Deployment failed during migration.",
+            "trust_score": 0.8,
+            "tags": "deployment,migration",
+            "reason": {
+                "summary": "matched migration tag",
+                "strategy": "fts+jaccard+hrr+trust",
+                "matched_terms": ["migration"],
+            },
+        }]
+
+
+def test_l2_adapter_uses_mark_retrieved_false_and_reason():
+    from plugins.memory.mnemosyne.injector import collect_l2_items
+
+    retriever = _FakeRetriever()
+    items, diagnostics = collect_l2_items(retriever, "migration", limit=3)
+
+    assert diagnostics == []
+    assert retriever.calls == [("search", "migration", 0.3, 3, False, {})]
+    assert items[0].item_id == "L2:fact:7"
+    assert items[0].layer == "L2"
+    assert items[0].reason_code == "l2_retrieval_reason"
+    assert "migration" in items[0].reason
+    assert items[0].reason_detail == (
+        ("matched_terms", ("migration",)),
+        ("strategy", "fts+jaccard+hrr+trust"),
+    )
+    assert items[0].score == 0.8
+    assert items[0].trust == 0.8
+
+
+class _UnavailableRetriever:
+    def search(self, *args, **kwargs):
+        raise RuntimeError("database locked")
+
+
+def test_l2_adapter_fails_open_when_retriever_unavailable():
+    from plugins.memory.mnemosyne.injector import collect_l2_items
+
+    items, diagnostics = collect_l2_items(_UnavailableRetriever(), "migration")
+
+    assert items == []
+    assert diagnostics == [{
+        "reason": "l2_unavailable",
+        "layer": "L2",
+        "message": "database locked",
+    }]
+
+
+class _UnavailableWiki:
+    def list_skills(self):
+        return type("Result", (), {
+            "available": False,
+            "reason": "database_unavailable",
+            "items": [],
+        })()
+
+
+def test_l3_unavailable_skillwiki_fails_open():
+    from plugins.memory.mnemosyne.injector import collect_l3_items
+
+    items, diagnostics = collect_l3_items(_UnavailableWiki(), "skill deploy")
+
+    assert items == []
+    assert diagnostics == [{"reason": "database_unavailable", "layer": "L3"}]
+
+
+class _FakeWiki:
+    def __init__(self):
+        self.calls = []
+
+    def list_skills(self):
+        self.calls.append("list_skills")
+        return type("Result", (), {
+            "available": True,
+            "items": [
+                {
+                    "skill_id": "github:acme/deploy:",
+                    "name": "deploy",
+                    "status": "verified",
+                    "source_url": "https://github.com/acme/deploy/tree/abc",
+                    "content_hash": "sha256:abc",
+                    "metadata_json": "{}",
+                },
+                {
+                    "skill_id": "github:acme/old-deploy:",
+                    "name": "old-deploy",
+                    "status": "archived",
+                    "source_url": "https://github.com/acme/old-deploy/tree/abc",
+                    "content_hash": "sha256:def",
+                    "metadata_json": "{}",
+                },
+                {
+                    "skill_id": "github:acme/partial:",
+                    "name": "partial",
+                    "status": "verified",
+                    "source_url": "",
+                    "content_hash": "",
+                    "metadata_json": "{}",
+                },
+            ],
+        })()
+
+
+def test_l3_intent_routing_is_deterministic_and_read_only():
+    from plugins.memory.mnemosyne.injector import collect_l3_items, is_skill_intent
+
+    assert is_skill_intent("which skill handles deploy?", {"deploy"}) is True
+    assert is_skill_intent("remember my lunch", {"deploy"}) is False
+
+    wiki = _FakeWiki()
+    items, diagnostics = collect_l3_items(
+        wiki,
+        "which skill handles deploy?",
+        known_skill_names={"deploy"},
+    )
+
+    assert diagnostics == []
+    assert wiki.calls == ["list_skills"]
+    assert [item.item_id for item in items] == ["L3:github:acme/deploy:"]
+    assert items[0].layer == "L3"
+    assert items[0].reason_code == "l3_skill_intent_match"
+    assert items[0].trust == 1.0
+
+
+def test_l3_filters_inactive_skills_and_lowers_incomplete_provenance_trust():
+    from plugins.memory.mnemosyne.injector import collect_l3_items
+
+    items, diagnostics = collect_l3_items(
+        _FakeWiki(),
+        "which skill handles partial?",
+        known_skill_names={"partial"},
+    )
+
+    assert diagnostics == []
+    assert [item.item_id for item in items] == ["L3:github:acme/partial:"]
+    assert items[0].trust < 1.0
+
+
 def test_l4_records_skip_malformed_source_refs_without_dropping_valid_refs():
     from plugins.memory.mnemosyne.contracts import MnemosyneSourceRef
     from plugins.memory.mnemosyne.injector import collect_l4_items
