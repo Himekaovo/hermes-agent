@@ -89,3 +89,43 @@ git diff --check
 ```
 
 Both commands completed successfully with no output.
+
+## Remaining Re-review Fix
+
+`L4CandidateRecord` remains a frozen dataclass, but its `payload` dict is mutable.
+`write_candidate()` now creates a fresh persistence copy, removes all read-time-derived
+fields (`read_state`, `decay_score`, `age_days`, and `archive_recommended`), preserves
+the prior `parent_session_id` default/type rule, and overwrites the copied `record_id`
+with `record.record_id`. This keeps duplicate detection and the record ID stable even
+when a caller mutates `record.payload` after construction.
+
+## Remaining Re-review TDD Evidence
+
+RED: the focused regression was added and run before the production fix:
+
+```text
+.venv/bin/pytest -q tests/plugins/memory/test_mnemosyne.py::test_l4_write_resanitizes_mutated_candidate_payload
+
+F                                                                        [100%]
+...
+E       AssertionError: assert 'read_state' not in {'age_days': 7, 'agent_id': 'agent-main', 'archive_recommended': False, 'archived_at': None, ...}
+1 failed in 0.09s
+```
+
+GREEN: after the write-boundary re-sanitization:
+
+```text
+.venv/bin/pytest -q tests/plugins/memory/test_mnemosyne.py::test_l4_write_resanitizes_mutated_candidate_payload
+
+.                                                                        [100%]
+1 passed in 0.07s
+```
+
+```text
+.venv/bin/pytest -q tests/plugins/memory/test_mnemosyne.py
+
+..............                                                           [100%]
+14 passed in 0.08s
+```
+
+`git diff --check` completed without output.
