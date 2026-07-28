@@ -170,6 +170,25 @@ def _check_identity(event: str, payload: dict[str, Any], context: dict[str, Any]
     )
 
 
+def _execution_context_error_result(
+    event: str,
+    payload: dict[str, Any],
+    missing_fields: list[str],
+) -> dict[str, Any]:
+    return make_result(
+        hook="execution-context",
+        event=event,
+        action="error",
+        reason_code="execution_context_invalid",
+        risk_level="unknown",
+        message="Structured execution context is incomplete.",
+        metadata={
+            "missing_fields": missing_fields,
+            "session_id": payload.get("session_id", ""),
+        },
+    )
+
+
 def _check_mode(event: str, payload: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
     planning_mode = bool(payload.get("planning_mode"))
     return make_result(
@@ -322,28 +341,33 @@ def run_safety_checks(
     ]
     results: list[dict[str, Any]] = []
     try:
-        if bounded_context(payload.get("session_id"), max_chars=120).strip():
-            context = normalize_execution_context(
-                {
-                    "agent_id": payload.get("agent_id", "unknown-agent"),
-                    "execution_kind": payload.get("execution_kind", "pre_llm_call"),
-                    "session_id": payload.get("session_id", ""),
-                    "task_id": payload.get("task_id"),
-                    "turn_id": payload.get("turn_id"),
-                    "user_message": payload.get("user_message"),
-                    "planning_mode": payload.get("planning_mode"),
-                    "delegation_target": payload.get("delegation_target"),
-                    "memory_hits": payload.get("memory_hits"),
-                    "requested_path": payload.get("requested_path"),
-                    "requested_paths": payload.get("requested_paths"),
-                }
-            )
-        for check in checks:
+        raw_context_payload = {
+            "agent_id": payload.get("agent_id"),
+            "execution_kind": payload.get("execution_kind"),
+            "session_id": payload.get("session_id"),
+            "task_id": payload.get("task_id"),
+            "turn_id": payload.get("turn_id"),
+            "user_message": payload.get("user_message"),
+            "planning_mode": payload.get("planning_mode"),
+            "delegation_target": payload.get("delegation_target"),
+            "memory_hits": payload.get("memory_hits"),
+            "requested_path": payload.get("requested_path"),
+            "requested_paths": payload.get("requested_paths"),
+        }
+        execution_context_error: dict[str, Any] | None = None
+        try:
+            context = normalize_execution_context(raw_context_payload)
+        except ExecutionContextError as exc:
+            execution_context_error = _execution_context_error_result(event, payload, exc.missing_fields)
+            context = {}
+        for index, check in enumerate(checks):
             outcome = check(event, payload, context)
             if isinstance(outcome, list):
                 results.extend(outcome)
             else:
                 results.append(outcome)
+            if index == 0 and execution_context_error is not None:
+                results.append(execution_context_error)
         results.extend(_check_security(event, payload, context))
     except Exception as exc:
         return [
