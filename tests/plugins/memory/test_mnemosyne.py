@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 import json
 
 import pytest
@@ -201,3 +201,83 @@ def test_l4_security_invariant_disables_store_on_symlink_escape(tmp_path):
 
     with pytest.raises(SecurityInvariantError):
         store.ensure_available()
+
+
+def test_l4_file_symlink_escape_is_rejected_without_touching_target(tmp_path):
+    from plugins.memory.mnemosyne.contracts import MnemosyneConfig
+    from plugins.memory.mnemosyne.l4_store import L4CandidateRecord, L4Store, SecurityInvariantError
+
+    outside = tmp_path.parent / "outside-l4.jsonl"
+    outside.write_bytes(b"outside sentinel\n")
+    l4_path = tmp_path / "memories" / "mnemosyne" / "l4.jsonl"
+    l4_path.parent.mkdir(parents=True)
+    l4_path.symlink_to(outside)
+    store = L4Store(tmp_path, profile_id="coder", config=MnemosyneConfig.from_mapping({}))
+
+    with pytest.raises(SecurityInvariantError):
+        store.ensure_available()
+    with pytest.raises(SecurityInvariantError):
+        store.write_candidate(L4CandidateRecord.from_mapping(_l4_record()))
+
+    assert outside.read_bytes() == b"outside sentinel\n"
+
+
+def test_l4_write_separates_unterminated_malformed_line_and_remains_idempotent(tmp_path):
+    from plugins.memory.mnemosyne.contracts import MnemosyneConfig
+    from plugins.memory.mnemosyne.l4_store import L4CandidateRecord, L4Store
+
+    l4_path = tmp_path / "memories" / "mnemosyne" / "l4.jsonl"
+    l4_path.parent.mkdir(parents=True)
+    l4_path.write_bytes(b"{bad json}")
+    store = L4Store(tmp_path, profile_id="coder", config=MnemosyneConfig.from_mapping({}))
+    record = L4CandidateRecord.from_mapping(_l4_record())
+
+    assert store.write_candidate(record)["written"] is True
+    assert store.write_candidate(record) == {"written": False, "reason": "duplicate"}
+    raw = l4_path.read_bytes().splitlines()
+    assert raw[0] == b"{bad json}"
+    assert json.loads(raw[1])["record_id"] == record.record_id
+    records, diagnostics = store.read_records()
+    assert [item["record_id"] for item in records] == [record.record_id]
+    assert diagnostics == [{"reason": "malformed_l4_line", "line": 0}]
+
+
+def test_l4_read_state_is_not_persisted_when_rewriting_read_output(tmp_path):
+    from plugins.memory.mnemosyne.contracts import MnemosyneConfig
+    from plugins.memory.mnemosyne.l4_store import L4CandidateRecord, L4Store
+
+    store = L4Store(tmp_path, profile_id="coder", config=MnemosyneConfig.from_mapping({}))
+    initial = L4CandidateRecord.from_mapping(_l4_record())
+    assert store.write_candidate(initial)["written"] is True
+    records, diagnostics = store.read_records()
+
+    assert diagnostics == []
+    rewritten = L4CandidateRecord.from_mapping({**records[0], "content": "A revised lesson."})
+    assert store.write_candidate(rewritten)["written"] is True
+    payloads = [json.loads(line) for line in store.path.read_text(encoding="utf-8").splitlines()]
+    assert all("read_state" not in payload for payload in payloads)
+
+
+def test_l4_mapping_read_state_is_not_persisted(tmp_path):
+    from plugins.memory.mnemosyne.contracts import MnemosyneConfig
+    from plugins.memory.mnemosyne.l4_store import L4CandidateRecord, L4Store
+
+    store = L4Store(tmp_path, profile_id="coder", config=MnemosyneConfig.from_mapping({}))
+    record = L4CandidateRecord.from_mapping(
+        _l4_record(read_state={"age_days": 7, "decay_score": 0.8, "archive_recommended": False})
+    )
+
+    assert store.write_candidate(record)["written"] is True
+    persisted = json.loads(store.path.read_text(encoding="utf-8"))
+    assert "read_state" not in persisted
+
+
+def test_l4_parent_session_id_type_and_none_id_are_distinct_from_empty():
+    from plugins.memory.mnemosyne.l4_store import L4CandidateRecord
+
+    none_parent = L4CandidateRecord.from_mapping(_l4_record(parent_session_id=None))
+    empty_parent = L4CandidateRecord.from_mapping(_l4_record(parent_session_id=""))
+
+    assert none_parent.record_id != empty_parent.record_id
+    with pytest.raises((TypeError, ValueError)):
+        L4CandidateRecord.from_mapping(_l4_record(parent_session_id=42))
