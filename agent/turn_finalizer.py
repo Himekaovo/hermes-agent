@@ -28,6 +28,33 @@ from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.message_content import flatten_message_text
 
 
+def _execution_kind_for(agent) -> str:
+    if getattr(agent, "_parent_session_id", None):
+        return "subagent"
+    if getattr(agent, "platform", None) == "cron":
+        return "cron"
+    return "interactive"
+
+
+def _flatten_hook_results(results) -> list[dict]:
+    flattened: list[dict] = []
+    for item in results or []:
+        if isinstance(item, list):
+            flattened.extend(result for result in item if isinstance(result, dict))
+        elif isinstance(item, dict):
+            flattened.append(item)
+    return flattened
+
+
+def _replace_visible_assistant_response(messages: list[dict], response_text: str) -> None:
+    for message in reversed(messages):
+        if isinstance(message, dict) and message.get("role") == "assistant":
+            message["content"] = response_text
+            message.pop("_db_persisted", None)
+            return
+    messages.append({"role": "assistant", "content": response_text})
+
+
 def _is_pure_tool_call_tail(msg: dict) -> bool:
     """An assistant row with ``tool_calls`` but no visible text content of its own.
 
@@ -404,6 +431,7 @@ def finalize_turn(
             logger.debug("turn-completion explainer failed: %s", _exp_err)
 
     _response_transformed = False
+    _raw_assistant_response = final_response
 
     # Plugin hook: transform_llm_output
     # Fired once per turn after the tool-calling loop completes.
@@ -427,6 +455,9 @@ def finalize_turn(
         except Exception as exc:
             logger.warning("transform_llm_output hook failed: %s", exc)
 
+    _safety_results: list[dict] = []
+    _safety_blocked = False
+
     # Plugin hook: post_llm_call
     # Fired once per turn after the tool-calling loop completes.
     # Plugins can use this to persist conversation data (e.g. sync
@@ -434,17 +465,48 @@ def finalize_turn(
     if final_response and not interrupted:
         try:
             from hermes_cli.plugins import invoke_hook as _invoke_hook
-            _invoke_hook(
+            _post_results = _invoke_hook(
                 "post_llm_call",
+                agent_id=getattr(agent, "agent_id", "") or getattr(agent, "session_id", ""),
+                execution_kind=_execution_kind_for(agent),
+                parent_session_id=getattr(agent, "_parent_session_id", None),
                 session_id=agent.session_id,
                 task_id=effective_task_id,
                 turn_id=turn_id,
                 user_message=original_user_message,
                 assistant_response=final_response,
+                original_assistant_response=_raw_assistant_response,
                 conversation_history=list(messages),
+                response_transformed=_response_transformed,
                 model=agent.model,
                 platform=getattr(agent, "platform", None) or "",
             )
+            _safety_results = _flatten_hook_results(_post_results)
+            _blocking_result = next(
+                (
+                    result for result in _safety_results
+                    if isinstance(result, dict) and result.get("action") == "block"
+                ),
+                None,
+            )
+            if _blocking_result is not None:
+                _safety_blocked = True
+                final_response = str(_blocking_result.get("message") or "").strip() or (
+                    "I can't share that response."
+                )
+                failed = True
+                completed = False
+                _turn_exit_reason = "safety_blocked"
+                _replace_visible_assistant_response(messages, final_response)
+                try:
+                    agent._persist_session(messages, conversation_history)
+                except Exception as _persist_err:
+                    _cleanup_errors.append(f"persist_session_post_safety: {_persist_err}")
+                    logger.error(
+                        "finalize_turn: post-safety _persist_session failed: %s",
+                        _persist_err,
+                        exc_info=True,
+                    )
         except Exception as exc:
             logger.warning("post_llm_call hook failed: %s", exc)
 
@@ -500,6 +562,10 @@ def finalize_turn(
         ).get("service_tier"),
         "session_id": agent.session_id,
     }
+    if _safety_results:
+        result["safety_results"] = _safety_results
+    if _safety_blocked:
+        result["safety_blocked"] = True
     if agent._tool_guardrail_halt_decision is not None:
         result["guardrail"] = agent._tool_guardrail_halt_decision.to_metadata()
     # Surface any post-loop cleanup failures so the caller can distinguish a
@@ -567,11 +633,18 @@ def finalize_turn(
         from hermes_cli.plugins import invoke_hook as _invoke_hook
         _invoke_hook(
             "on_session_end",
+            agent_id=getattr(agent, "agent_id", "") or getattr(agent, "session_id", ""),
+            execution_kind=_execution_kind_for(agent),
+            parent_session_id=getattr(agent, "_parent_session_id", None),
             session_id=agent.session_id,
             task_id=effective_task_id,
             turn_id=turn_id,
             completed=completed,
             interrupted=interrupted,
+            safety_blocked=_safety_blocked,
+            safety_results=_safety_results,
+            verification=None,
+            conversation_history=list(messages),
             model=agent.model,
             platform=getattr(agent, "platform", None) or "",
         )

@@ -1,21 +1,28 @@
-"""Deterministic safety hook primitives for pre-LLM guardrails."""
+"""Deterministic safety hook primitives for pre/post-LLM guardrails."""
 
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import Mapping
-from pathlib import PurePath
+from datetime import datetime, timezone
+from pathlib import Path, PurePath
 from typing import Any, Callable
 
 
 ALLOWED_ACTIONS = frozenset({"allow", "warn", "block", "error", "skip"})
 ALLOWED_RISK_LEVELS = frozenset({"low", "medium", "high", "critical", "unknown"})
 ALLOWED_EXECUTION_KINDS = frozenset({"interactive", "cron", "subagent"})
+ALLOWED_VERIFICATION_STATUSES = frozenset({"passed", "failed", "not_run", "unavailable"})
 _MAX_TEXT_CHARS = 200
 _MAX_LIST_ITEMS = 20
 _MAX_DICT_ITEMS = 20
 _MAX_DEPTH = 4
+_MAX_AUDIT_MESSAGES = 8
 _REDACTED = "[REDACTED]"
+_SAFE_EGRESS_BLOCK_MESSAGE = (
+    "I can't share that response because it may contain sensitive data."
+)
 _SECRET_KEY_NAMES = (
     "api_key",
     "apikey",
@@ -57,6 +64,10 @@ def bounded_context(value: Any, *, max_chars: int = _MAX_TEXT_CHARS) -> str:
     if max_chars < 0:
         raise ValueError("max_chars must be non-negative")
     return text[:max_chars]
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def _contains_secret_key(key: str) -> bool:
@@ -174,32 +185,9 @@ def normalize_execution_context(payload: dict[str, Any]) -> dict[str, Any]:
     return context
 
 
-def _check_identity(event: str, payload: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
-    session_id = bounded_context(payload.get("session_id"), max_chars=120).strip()
-    if not session_id:
-        return make_result(
-            hook="identity",
-            event=event,
-            action="block",
-            reason_code="identity_missing",
-            risk_level="high",
-            message="Structured execution identity is required.",
-            metadata={"missing_fields": ["session_id"]},
-        )
-    return make_result(
-        hook="identity",
-        event=event,
-        action="allow",
-        reason_code="identity_present",
-        risk_level="low",
-        message="Structured execution identity present.",
-        metadata={"session_id": session_id},
-    )
-
-
 def _execution_context_error_result(
     event: str,
-    payload: dict[str, Any],
+    payload: Mapping[str, Any],
     missing_fields: list[str],
 ) -> dict[str, Any]:
     return make_result(
@@ -229,6 +217,29 @@ def _malformed_payload_error_result(event: str, payload: Any) -> dict[str, Any]:
             "payload_type": type(payload).__name__,
             "payload_preview": _sanitize_value(payload),
         },
+    )
+
+
+def _check_identity(event: str, payload: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
+    session_id = bounded_context(payload.get("session_id"), max_chars=120).strip()
+    if not session_id:
+        return make_result(
+            hook="identity",
+            event=event,
+            action="block",
+            reason_code="identity_missing",
+            risk_level="high",
+            message="Structured execution identity is required.",
+            metadata={"missing_fields": ["session_id"]},
+        )
+    return make_result(
+        hook="identity",
+        event=event,
+        action="allow",
+        reason_code="identity_present",
+        risk_level="low",
+        message="Structured execution identity present.",
+        metadata={"session_id": session_id},
     )
 
 
@@ -379,11 +390,241 @@ def _check_security(event: str, payload: dict[str, Any], context: dict[str, Any]
     return results
 
 
+def _normalize_verification_status(value: Any, *, evidence_present: bool = False) -> str:
+    status = bounded_context(value, max_chars=40).strip().lower()
+    if status in ALLOWED_VERIFICATION_STATUSES:
+        if status == "passed" and not evidence_present:
+            return "not_run"
+        return status
+    if status in {"unverified", "stale"}:
+        return "not_run"
+    if status in {"not_applicable", "n/a", "na"}:
+        return "unavailable"
+    return "unavailable"
+
+
+def _verification_status_from_payload(payload: Mapping[str, Any]) -> tuple[str, dict[str, Any]]:
+    verification = payload.get("verification")
+    if verification is None:
+        return "unavailable", {
+            "source": "payload",
+            "verification_present": False,
+            "verification_status": "unavailable",
+        }
+    if not isinstance(verification, Mapping):
+        return "unavailable", {
+            "source": "payload",
+            "verification_present": True,
+            "verification_type": type(verification).__name__,
+            "verification_status": "unavailable",
+        }
+    evidence = verification.get("evidence")
+    evidence_present = evidence not in (None, "", [], {})
+    status = _normalize_verification_status(
+        verification.get("status"),
+        evidence_present=evidence_present,
+    )
+    metadata = {
+        "source": "payload",
+        "verification_present": True,
+        "verification_status": status,
+        "evidence_present": evidence_present,
+    }
+    for key in ("command", "summary", "reason", "tool"):
+        if key in verification:
+            metadata[key] = _sanitize_value(verification.get(key))
+    return status, metadata
+
+
+def _iter_text_candidates(*values: Any) -> list[str]:
+    return [value for value in values if isinstance(value, str) and value]
+
+
+def _contains_secret_like_text(*values: Any) -> bool:
+    return any(
+        _SECRET_VALUE_RE.search(candidate) or _SECRET_TOKEN_RE.search(candidate)
+        for candidate in _iter_text_candidates(*values)
+    )
+
+
+def _check_egress_inspector(event: str, payload: Mapping[str, Any]) -> dict[str, Any]:
+    original = payload.get("original_assistant_response")
+    visible = payload.get("assistant_response")
+    secret_found = _contains_secret_like_text(original, visible)
+    return make_result(
+        hook="egress-inspector",
+        event=event,
+        action="block" if secret_found else "allow",
+        reason_code="secret_detected" if secret_found else "egress_clear",
+        risk_level="high" if secret_found else "low",
+        message=_SAFE_EGRESS_BLOCK_MESSAGE if secret_found else "Egress inspection clear.",
+        metadata={
+            "inspected_original": isinstance(original, str) and bool(original),
+            "inspected_visible": isinstance(visible, str) and bool(visible),
+            "response_preview": _sanitize_value(original if isinstance(original, str) else visible),
+        },
+    )
+
+
+def _check_verification_gate(event: str, payload: Mapping[str, Any]) -> dict[str, Any]:
+    status, metadata = _verification_status_from_payload(payload)
+    return make_result(
+        hook="verification-gate",
+        event=event,
+        action="allow" if status == "passed" else "skip",
+        reason_code=f"verification_{status}",
+        risk_level="low" if status == "passed" else "unknown",
+        message="Verification evidence attached." if status == "passed" else "Verification evidence unavailable or incomplete.",
+        metadata=metadata,
+    )
+
+
+def _check_a2a_metadata_processor(event: str, payload: Mapping[str, Any]) -> dict[str, Any]:
+    metadata = payload.get("a2a_metadata")
+    present = isinstance(metadata, Mapping) and bool(metadata)
+    return make_result(
+        hook="a2a-metadata-processor",
+        event=event,
+        action="allow" if present else "skip",
+        reason_code="a2a_metadata_present" if present else "a2a_metadata_absent",
+        risk_level="low" if present else "unknown",
+        message="A2A metadata processed." if present else "No A2A metadata supplied.",
+        metadata={"a2a_metadata": _sanitize_value(metadata or {})},
+    )
+
+
+def _check_generic_postprocessor(event: str, payload: Mapping[str, Any]) -> dict[str, Any]:
+    response = payload.get("assistant_response")
+    return make_result(
+        hook="generic-postprocessor",
+        event=event,
+        action="allow",
+        reason_code="postprocess_complete",
+        risk_level="low",
+        message="Generic postprocessing completed.",
+        metadata={
+            "response_chars": len(response) if isinstance(response, str) else 0,
+            "response_transformed": bool(payload.get("response_transformed")),
+        },
+    )
+
+
+def _run_post_llm_checks(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
+    return [
+        _check_egress_inspector("post_llm_call", payload),
+        _check_verification_gate("post_llm_call", payload),
+        _check_a2a_metadata_processor("post_llm_call", payload),
+        _check_generic_postprocessor("post_llm_call", payload),
+    ]
+
+
+def _bounded_message_preview(messages: Any) -> list[dict[str, Any]]:
+    if not isinstance(messages, list):
+        return []
+    preview: list[dict[str, Any]] = []
+    for message in messages[-_MAX_AUDIT_MESSAGES:]:
+        if not isinstance(message, Mapping):
+            preview.append({"type": type(message).__name__, "value": _sanitize_value(message)})
+            continue
+        preview.append(
+            {
+                "role": bounded_context(message.get("role"), max_chars=40),
+                "content": _sanitize_value(message.get("content")),
+            }
+        )
+    return preview
+
+
+def _audit_log_path() -> Path:
+    from hermes_constants import get_hermes_home
+
+    return get_hermes_home() / "logs" / "safety" / "session-archiver.jsonl"
+
+
+def _emit_memory_governance_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
+    from hermes_constants import get_hermes_home
+    from tools import memory_governance
+
+    governance_dir = get_hermes_home() / "memories" / "governance"
+    note = json.dumps(_sanitize_value(candidate), ensure_ascii=False, sort_keys=True)
+    return memory_governance.record_meta(
+        governance_dir,
+        "session_archiver_candidate",
+        "success",
+        note=note,
+    )
+
+
+def _run_session_archiver(payload: Mapping[str, Any]) -> dict[str, Any]:
+    verification_status, _ = _verification_status_from_payload(payload)
+    incidents = payload.get("safety_results")
+    incident_count = len(incidents) if isinstance(incidents, list) else 0
+    record = {
+        "created_at": _now_iso(),
+        "session_id": bounded_context(payload.get("session_id"), max_chars=120),
+        "task_id": bounded_context(payload.get("task_id"), max_chars=120),
+        "turn_id": bounded_context(payload.get("turn_id"), max_chars=120),
+        "agent_id": bounded_context(payload.get("agent_id"), max_chars=120),
+        "execution_kind": bounded_context(payload.get("execution_kind"), max_chars=120),
+        "completed": bool(payload.get("completed")),
+        "interrupted": bool(payload.get("interrupted")),
+        "safety_blocked": bool(payload.get("safety_blocked")),
+        "verification_status": verification_status,
+        "incident_count": incident_count,
+        "safety_results": _sanitize_value(incidents or []),
+        "conversation_preview": _bounded_message_preview(payload.get("conversation_history")),
+    }
+    audit_path = _audit_log_path()
+    archive_status = "written"
+    memory_candidate_status = "not_emitted"
+    try:
+        audit_path.parent.mkdir(parents=True, exist_ok=True)
+        with audit_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(_sanitize_value(record), ensure_ascii=False, sort_keys=True) + "\n")
+    except Exception:
+        archive_status = "write_failed"
+    if record["conversation_preview"]:
+        try:
+            _emit_memory_governance_candidate(
+                {
+                    "session_id": record["session_id"],
+                    "turn_id": record["turn_id"],
+                    "verification_status": verification_status,
+                    "incident_count": incident_count,
+                    "conversation_preview": record["conversation_preview"],
+                }
+            )
+            memory_candidate_status = "submitted"
+        except Exception:
+            memory_candidate_status = "governance_missing"
+    return make_result(
+        hook="session-archiver",
+        event="on_session_end",
+        action="allow" if archive_status == "written" else "warn",
+        reason_code="session_archived" if archive_status == "written" else "session_archive_degraded",
+        risk_level="low" if archive_status == "written" else "unknown",
+        message="Session archive recorded." if archive_status == "written" else "Session archive completed with degraded protections.",
+        metadata={
+            "audit_path": str(audit_path),
+            "archive_status": archive_status,
+            "verification_status": verification_status,
+            "incident_count": incident_count,
+            "memory_candidate_status": memory_candidate_status,
+            "session_id": payload.get("session_id"),
+        },
+    )
+
+
 def run_safety_checks(
     event: str,
     payload: Any,
     config: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
+    if not isinstance(payload, Mapping):
+        return [_malformed_payload_error_result(event, payload)]
+    if event == "post_llm_call":
+        return _run_post_llm_checks(payload)
+
     context: dict[str, Any] = {}
     checks: list[Callable[[str, dict[str, Any], dict[str, Any]], dict[str, Any] | list[dict[str, Any]]]] = [
         _check_identity,
@@ -394,8 +635,6 @@ def run_safety_checks(
     ]
     results: list[dict[str, Any]] = []
     execution_context_error: dict[str, Any] | None = None
-    if not isinstance(payload, Mapping):
-        return [_malformed_payload_error_result(event, payload)]
     try:
         raw_context_payload = {
             "agent_id": payload.get("agent_id"),
@@ -416,7 +655,7 @@ def run_safety_checks(
         except ExecutionContextError as exc:
             execution_context_error = _execution_context_error_result(event, payload, exc.missing_fields)
             context = {}
-        for index, check in enumerate(checks):
+        for check in checks:
             outcome = check(event, payload, context)
             if isinstance(outcome, list):
                 results.extend(outcome)
@@ -451,4 +690,16 @@ def build_safety_hook_overrides(
     def _pre_llm_call(**kwargs: Any) -> list[dict[str, Any]]:
         return run_safety_checks("pre_llm_call", kwargs, config=config)
 
-    return {"pre_llm_call": [_pre_llm_call]}
+    def _post_llm_call(**kwargs: Any) -> list[dict[str, Any]]:
+        return run_safety_checks("post_llm_call", kwargs, config=config)
+
+    def _on_session_end(**kwargs: Any) -> dict[str, Any]:
+        if not isinstance(kwargs, Mapping):
+            return _malformed_payload_error_result("on_session_end", kwargs)
+        return _run_session_archiver(kwargs)
+
+    return {
+        "pre_llm_call": [_pre_llm_call],
+        "post_llm_call": [_post_llm_call],
+        "on_session_end": [_on_session_end],
+    }
