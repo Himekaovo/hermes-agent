@@ -59,6 +59,7 @@ def _replace_visible_assistant_response(messages: list[dict], response_text: str
 
 
 def _verification_payload_from_results(results) -> dict[str, str] | None:
+    fallback = None
     for result in results or []:
         if not isinstance(result, dict) or result.get("hook") != "verification-gate":
             continue
@@ -67,8 +68,10 @@ def _verification_payload_from_results(results) -> dict[str, str] | None:
             continue
         status = str(metadata.get("verification_status") or "").strip().lower()
         if status in _ALLOWED_VERIFICATION_STATUSES:
-            return {"status": status}
-    return None
+            if status != "unavailable":
+                return {"status": status}
+            fallback = {"status": status}
+    return fallback
 
 
 def _prepare_messages_for_final_persist(agent, messages: list[dict], final_response, interrupted) -> None:
@@ -383,24 +386,47 @@ def finalize_turn(
     # to an external memory system).
     if final_response and not interrupted:
         try:
-            from hermes_cli.plugins import invoke_hook as _invoke_hook
-            _post_results = _invoke_hook(
-                "post_llm_call",
-                agent_id=getattr(agent, "agent_id", "") or getattr(agent, "session_id", ""),
-                execution_kind=_execution_kind_for(agent),
-                parent_session_id=getattr(agent, "_parent_session_id", None),
-                session_id=agent.session_id,
-                task_id=effective_task_id,
-                turn_id=turn_id,
-                user_message=original_user_message,
-                assistant_response=final_response,
-                original_assistant_response=_raw_assistant_response,
-                conversation_history=list(messages),
-                response_transformed=_response_transformed,
-                model=agent.model,
-                platform=getattr(agent, "platform", None) or "",
+            from agent.safety_hooks import (
+                run_builtin_post_llm_checks,
+                run_builtin_post_llm_preflight,
             )
-            _safety_results = _flatten_hook_results(_post_results)
+            from hermes_cli.plugins import get_plugin_manager as _get_plugin_manager
+
+            _post_payload = {
+                "agent_id": getattr(agent, "agent_id", "") or getattr(agent, "session_id", ""),
+                "execution_kind": _execution_kind_for(agent),
+                "parent_session_id": getattr(agent, "_parent_session_id", None),
+                "session_id": agent.session_id,
+                "task_id": effective_task_id,
+                "turn_id": turn_id,
+                "user_message": original_user_message,
+                "assistant_response": final_response,
+                "original_assistant_response": _raw_assistant_response,
+                "conversation_history": list(messages),
+                "response_transformed": _response_transformed,
+                "model": agent.model,
+                "platform": getattr(agent, "platform", None) or "",
+            }
+            _egress_result = run_builtin_post_llm_preflight(_post_payload)
+            if _egress_result.get("action") == "block":
+                _safety_blocked = True
+                final_response = str(_egress_result.get("message") or "").strip() or (
+                    "I can't share that response."
+                )
+                failed = True
+                completed = False
+                _turn_exit_reason = "safety_blocked"
+                _replace_visible_assistant_response(messages, final_response)
+                _post_payload["assistant_response"] = final_response
+                _post_payload["original_assistant_response"] = final_response
+                _post_payload["conversation_history"] = list(messages)
+            _post_results = _get_plugin_manager().invoke_hook("post_llm_call", **_post_payload)
+            _global_post_results = _flatten_hook_results(_post_results)
+            _builtin_post_results = run_builtin_post_llm_checks(
+                _post_payload,
+                egress_result=_egress_result,
+            )
+            _safety_results = [*_builtin_post_results, *_global_post_results]
             _verification = _verification_payload_from_results(_safety_results)
             _blocking_result = next(
                 (

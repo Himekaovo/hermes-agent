@@ -382,6 +382,39 @@ def test_post_llm_auditor_blocks_sensitive_response_without_leaking_secret():
     assert all("sk-test-secret" not in repr(r) for r in results)
 
 
+def test_builtin_post_llm_checks_reuse_preflight_result_without_reexposing_secret():
+    from agent.safety_hooks import (
+        _SAFE_EGRESS_BLOCK_MESSAGE,
+        run_builtin_post_llm_checks,
+        run_builtin_post_llm_preflight,
+    )
+
+    blocked_payload = {
+        "agent_id": "agent-1",
+        "execution_kind": "interactive",
+        "session_id": "s1",
+        "task_id": "t1",
+        "turn_id": "u1",
+        "assistant_response": "my api key is sk-test-secret",
+        "original_assistant_response": "my api key is sk-test-secret",
+    }
+    preflight = run_builtin_post_llm_preflight(blocked_payload)
+
+    sanitized_results = run_builtin_post_llm_checks(
+        {
+            **blocked_payload,
+            "assistant_response": _SAFE_EGRESS_BLOCK_MESSAGE,
+            "original_assistant_response": _SAFE_EGRESS_BLOCK_MESSAGE,
+        },
+        egress_result=preflight,
+    )
+
+    assert sanitized_results[0] is preflight
+    assert sanitized_results[0]["action"] == "block"
+    assert sanitized_results[0]["message"] == _SAFE_EGRESS_BLOCK_MESSAGE
+    assert all("sk-test-secret" not in repr(result) for result in sanitized_results)
+
+
 def test_verification_gate_marks_missing_evidence_unavailable():
     from agent.safety_hooks import run_safety_checks
 

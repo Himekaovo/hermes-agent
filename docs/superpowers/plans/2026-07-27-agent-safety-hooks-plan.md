@@ -525,3 +525,11 @@ Record the exact focused test count and related regression count in the final re
 - Placeholder scan: no `TBD`, `TODO`, or unspecified implementation steps are present.
 - Type consistency: `run_safety_checks`, `build_safety_hook_overrides`, `make_result`, `bounded_context`, and `normalize_config` are referenced consistently across tasks.
 - Scope check: all tasks stay within the approved local Hook safety layer and do not introduce a second event bus or external security service.
+
+## Local Report: 2026-07-28 Task 3 Egress Ordering Leak
+
+- Fixed the remaining high-severity `post_llm_call` ordering leak in `agent/turn_finalizer.py` by running built-in egress preflight before any global plugin-manager callback.
+- When built-in egress blocks, the finalizer now replaces the visible response and transcript first, marks `safety_blocked`, and calls global post hooks only with the sanitized response payload.
+- When built-in egress allows the response, global post hooks still receive the raw assistant text, while built-in post results are collected directly afterward so the deterministic safety audit remains ordered and non-duplicative.
+- Verification status forwarding now prefers the first concrete non-`unavailable` verification result, preserving Task 3 session-archiver behavior after prepending built-in post results.
+- Added regression coverage for the blocked global-hook path, the allow path, and built-in post-helper reuse.

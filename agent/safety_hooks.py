@@ -510,8 +510,20 @@ def _check_generic_postprocessor(event: str, payload: Mapping[str, Any]) -> dict
 
 
 def _run_post_llm_checks(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
+    return run_builtin_post_llm_checks(payload)
+
+
+def run_builtin_post_llm_preflight(payload: Mapping[str, Any]) -> dict[str, Any]:
+    return _check_egress_inspector("post_llm_call", payload)
+
+
+def run_builtin_post_llm_checks(
+    payload: Mapping[str, Any],
+    *,
+    egress_result: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
     return [
-        _check_egress_inspector("post_llm_call", payload),
+        egress_result if isinstance(egress_result, dict) else run_builtin_post_llm_preflight(payload),
         _check_verification_gate("post_llm_call", payload),
         _check_a2a_metadata_processor("post_llm_call", payload),
         _check_generic_postprocessor("post_llm_call", payload),
