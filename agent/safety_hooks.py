@@ -131,6 +131,7 @@ def normalize_execution_context(payload: dict[str, Any]) -> dict[str, Any]:
         "session_id": bounded_context(payload["session_id"], max_chars=120),
     }
     for optional in (
+        "parent_session_id",
         "task_id",
         "turn_id",
         "user_message",
@@ -345,6 +346,7 @@ def run_safety_checks(
             "agent_id": payload.get("agent_id"),
             "execution_kind": payload.get("execution_kind"),
             "session_id": payload.get("session_id"),
+            "parent_session_id": payload.get("parent_session_id"),
             "task_id": payload.get("task_id"),
             "turn_id": payload.get("turn_id"),
             "user_message": payload.get("user_message"),

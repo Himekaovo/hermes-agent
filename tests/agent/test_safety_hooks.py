@@ -38,6 +38,21 @@ def test_normalize_execution_context_rejects_missing_required_fields():
     assert excinfo.value.missing_fields == ["agent_id", "execution_kind", "session_id"]
 
 
+def test_normalize_execution_context_preserves_parent_session_id_for_subagent():
+    from agent.safety_hooks import normalize_execution_context
+
+    context = normalize_execution_context(
+        {
+            "agent_id": "agent-2",
+            "execution_kind": "subagent",
+            "session_id": "child-session",
+            "parent_session_id": "parent-session",
+        }
+    )
+
+    assert context["parent_session_id"] == "parent-session"
+
+
 def test_identity_check_blocks_missing_session_id():
     from agent.safety_hooks import run_safety_checks
 
@@ -135,3 +150,28 @@ def test_run_safety_checks_have_stable_hook_order_for_clean_payload():
         "context-propagation",
         "security-inspector",
     ]
+
+
+def test_run_safety_checks_preserves_parent_session_id_for_subagent_payload():
+    from agent.safety_hooks import run_safety_checks
+
+    results = run_safety_checks(
+        "pre_llm_call",
+        {
+            "agent_id": "agent-2",
+            "execution_kind": "subagent",
+            "session_id": "child-session",
+            "parent_session_id": "parent-session",
+            "task_id": "t1",
+            "turn_id": "u1",
+            "user_message": "hello from child",
+        },
+    )
+
+    identity_result = next(r for r in results if r["reason_code"] == "identity_present")
+    assert identity_result["metadata"]["session_id"] == "child-session"
+
+    context_result = next(r for r in results if r["reason_code"] == "context_fields_present")
+    assert context_result["action"] == "allow"
+
+    assert all(r["reason_code"] != "execution_context_invalid" for r in results)
