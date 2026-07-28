@@ -3509,6 +3509,9 @@ class AIAgent:
         original_user_message: Any,
         final_response: Any,
         interrupted: bool,
+        completed: bool = True,
+        failed: bool = False,
+        safety_blocked: bool = False,
         messages: list | None = None,
     ) -> None:
         """Mirror a completed turn into external memory providers.
@@ -3523,21 +3526,22 @@ class AIAgent:
         because the latter may carry injected skill content that bloats
         or breaks provider queries.
 
-        Interrupted turns are skipped entirely (#15218).  A partial
-        assistant output, an aborted tool chain, or a mid-stream reset
-        is not durable conversational truth — mirroring it into an
-        external memory backend pollutes future recall with state the
-        user never saw completed.  The prefetch is gated on the same
-        flag: the user's next message is almost certainly a retry of
-        the same intent, and a prefetch keyed on the interrupted turn
-        would fire against stale context.
+        Interrupted, failed, incomplete, or safety-blocked turns are
+        skipped entirely (#15218 and follow-on safety lifecycle fixes).
+        A partial assistant output, an aborted tool chain, or a response
+        suppressed by safety policy is not durable conversational truth
+        — mirroring it into an external memory backend pollutes future
+        recall with state the user never saw completed. The prefetch is
+        gated on the same outcome: the user's next message is almost
+        certainly a retry of the same intent, and a prefetch keyed on a
+        non-successful turn would fire against stale context.
 
         Normal completed turns still sync as before.  The whole body is
         wrapped in ``try/except Exception`` because external memory
         providers are strictly best-effort — a misconfigured or offline
         backend must not block the user from seeing their response.
         """
-        if interrupted:
+        if interrupted or failed or not completed or safety_blocked:
             return
         if not (self._memory_manager and final_response and original_user_message):
             return

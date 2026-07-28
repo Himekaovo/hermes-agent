@@ -655,3 +655,100 @@ def test_session_end_archiver_preserves_structured_verification_status(
     )
 
     assert result["metadata"]["verification_status"] == verification_status
+
+
+@pytest.mark.parametrize(
+    ("completed", "safety_blocked", "execution_kind"),
+    [
+        (False, False, "interactive"),
+        (True, True, "interactive"),
+        (True, False, "subagent"),
+    ],
+)
+def test_session_end_archiver_never_submits_memory_candidate_for_blocked_incomplete_or_subagent_turns(
+    tmp_path, monkeypatch, completed, safety_blocked, execution_kind
+):
+    import agent.safety_hooks as safety_hooks
+
+    captured: list[dict[str, object]] = []
+
+    def fake_emit(candidate):
+        captured.append(candidate)
+        return {"ok": True}
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.setattr(safety_hooks, "_emit_memory_governance_candidate", fake_emit, raising=False)
+
+    callback = safety_hooks.build_safety_hook_overrides()["on_session_end"][0]
+    result = callback(
+        agent_id="agent-1",
+        execution_kind=execution_kind,
+        session_id="s1",
+        task_id="t1",
+        turn_id="u1",
+        completed=completed,
+        interrupted=False,
+        safety_blocked=safety_blocked,
+        conversation_history=[
+            {"role": "user", "content": "api_key=sk-test-secret"},
+            {"role": "assistant", "content": "Noted."},
+        ],
+    )
+
+    assert result["metadata"]["archive_status"] == "written"
+    assert result["metadata"]["memory_candidate_status"] == "not_emitted"
+    assert captured == []
+    audit_path = Path(result["metadata"]["audit_path"])
+    assert audit_path.exists()
+    audit_record = json.loads(audit_path.read_text(encoding="utf-8").strip())
+    assert audit_record["completed"] is completed
+    assert audit_record["safety_blocked"] is safety_blocked
+    assert audit_record["execution_kind"] == execution_kind
+    assert "sk-test-secret" not in json.dumps(audit_record)
+
+
+def test_session_end_archiver_cleanup_resets_context_and_clears_spill_state_fail_open(
+    tmp_path, monkeypatch
+):
+    import agent.safety_hooks as safety_hooks
+
+    token = safety_hooks._ACTIVE_CONTEXT_CHAR_LIMIT.set(77)
+    cleanup_calls: list[dict[str, object]] = []
+
+    def fake_cleanup(*, payload):
+        cleanup_calls.append(
+            {
+                "session_id": payload.get("session_id"),
+                "limit_before_cleanup": safety_hooks._ACTIVE_CONTEXT_CHAR_LIMIT.get(),
+            }
+        )
+        raise RuntimeError("cleanup boom")
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.setattr(safety_hooks, "_clear_session_archiver_spill_state", fake_cleanup)
+    callback = safety_hooks.build_safety_hook_overrides(
+        {"max_context_chars": 33}
+    )["on_session_end"][0]
+
+    try:
+        result = callback(
+            agent_id="agent-1",
+            execution_kind="interactive",
+            session_id="sess-cleanup",
+            task_id="task-cleanup",
+            turn_id="turn-cleanup",
+            completed=True,
+            interrupted=False,
+            conversation_history=[
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "done"},
+            ],
+        )
+        assert cleanup_calls == [
+            {"session_id": "sess-cleanup", "limit_before_cleanup": 33}
+        ]
+        assert result["hook"] == "session-archiver"
+        assert result["metadata"]["archive_status"] == "written"
+        assert safety_hooks._ACTIVE_CONTEXT_CHAR_LIMIT.get() == 77
+    finally:
+        safety_hooks._ACTIVE_CONTEXT_CHAR_LIMIT.reset(token)

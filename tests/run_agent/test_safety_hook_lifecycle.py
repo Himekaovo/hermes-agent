@@ -79,6 +79,9 @@ class _FinalizerAgent:
         self._parent_session_id = None
         self.persist_calls = []
         self._stream_callback = None
+        self.sync_calls = []
+        self.prefetch_calls = []
+        self._memory_manager = None
 
     def _handle_max_iterations(self, messages, api_call_count):
         raise AssertionError("not expected")
@@ -114,7 +117,7 @@ class _FinalizerAgent:
         pass
 
     def _sync_external_memory_for_turn(self, **_kwargs):
-        pass
+        self.sync_calls.append(_kwargs)
 
 
 def _finalize(agent, *, final_response, turn_id="turn-post-block", task_id="task-post-block"):
@@ -390,3 +393,107 @@ def test_finalize_turn_runs_session_archiver_fail_open(monkeypatch, tmp_path):
     assert captured["calls"] == 1
     assert result["hook"] == "session-archiver"
     assert result["metadata"]["memory_candidate_status"] == "governance_missing"
+
+
+def test_finalize_turn_skips_external_memory_sync_for_failed_turns():
+    agent = _FinalizerAgent()
+
+    result = finalize_turn(
+        agent,
+        final_response="All done.",
+        api_call_count=1,
+        interrupted=False,
+        failed=True,
+        messages=[
+            {"role": "user", "content": "say hi"},
+            {"role": "assistant", "content": "All done."},
+        ],
+        conversation_history=[],
+        effective_task_id="task-sync",
+        turn_id="turn-sync",
+        user_message="say hi",
+        original_user_message="say hi",
+        _should_review_memory=False,
+        _turn_exit_reason="tool_error",
+    )
+
+    assert result["completed"] is False
+    assert agent.sync_calls == []
+
+
+def test_finalize_turn_preserves_successful_external_memory_sync(monkeypatch):
+    class _CountingAgent(_FinalizerAgent):
+        def _sync_external_memory_for_turn(self, **kwargs):
+            self.sync_calls.append(kwargs)
+
+    agent = _CountingAgent()
+
+    result = finalize_turn(
+        agent,
+        final_response="All done.",
+        api_call_count=1,
+        interrupted=False,
+        failed=False,
+        messages=[
+            {"role": "user", "content": "say hi"},
+            {"role": "assistant", "content": "All done."},
+        ],
+        conversation_history=[],
+        effective_task_id="task-sync-ok",
+        turn_id="turn-sync-ok",
+        user_message="say hi",
+        original_user_message="say hi",
+        _should_review_memory=False,
+        _turn_exit_reason="text_response(finish_reason=stop)",
+    )
+
+    assert result["completed"] is True
+    assert len(agent.sync_calls) == 1
+    assert agent.sync_calls[0]["final_response"] == "All done."
+
+
+def test_finalize_turn_skips_external_memory_sync_for_incomplete_turns():
+    agent = _FinalizerAgent()
+
+    result = finalize_turn(
+        agent,
+        final_response=None,
+        api_call_count=1,
+        interrupted=False,
+        failed=False,
+        messages=[{"role": "user", "content": "say hi"}],
+        conversation_history=[],
+        effective_task_id="task-sync-incomplete",
+        turn_id="turn-sync-incomplete",
+        user_message="say hi",
+        original_user_message="say hi",
+        _should_review_memory=False,
+        _turn_exit_reason="unknown",
+    )
+
+    assert result["completed"] is False
+    assert agent.sync_calls == []
+
+
+def test_finalize_turn_skips_external_memory_sync_when_post_llm_safety_blocks(monkeypatch):
+    import agent.safety_hooks as safety_hooks
+
+    def fake_invoke_hook(name, **kwargs):
+        if name == "transform_llm_output":
+            return []
+        if name == "on_session_end":
+            callback = safety_hooks.build_safety_hook_overrides()["on_session_end"][0]
+            return [callback(**kwargs)]
+        return []
+
+    class _CountingAgent(_FinalizerAgent):
+        def _sync_external_memory_for_turn(self, **kwargs):
+            self.sync_calls.append(kwargs)
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", fake_invoke_hook)
+    agent = _CountingAgent()
+
+    result = _finalize(agent, final_response="my api key is sk-test-secret")
+
+    assert result["safety_blocked"] is True
+    assert agent.sync_calls == []

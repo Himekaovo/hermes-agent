@@ -65,6 +65,10 @@ _ACTIVE_CONTEXT_CHAR_LIMIT: ContextVar[int] = ContextVar(
     "SAFETY_HOOK_CONTEXT_CHAR_LIMIT",
     default=_MAX_CONTEXT_CHARS_LIMIT,
 )
+_ACTIVE_SESSION_ARCHIVER_PAYLOAD: ContextVar[Mapping[str, Any] | None] = ContextVar(
+    "SAFETY_HOOK_SESSION_ARCHIVER_PAYLOAD",
+    default=None,
+)
 
 
 class ExecutionContextError(ValueError):
@@ -704,6 +708,33 @@ def _emit_memory_governance_candidate(candidate: dict[str, Any]) -> dict[str, An
     )
 
 
+def _should_submit_memory_candidate(record: Mapping[str, Any]) -> bool:
+    if not record.get("conversation_preview"):
+        return False
+    if not bool(record.get("completed")):
+        return False
+    if bool(record.get("safety_blocked")):
+        return False
+    return str(record.get("execution_kind") or "").strip().lower() != "subagent"
+
+
+def _clear_session_archiver_spill_state(*, payload: Mapping[str, Any]) -> None:
+    """Best-effort cleanup for session-local hook spill state.
+
+    The built-in archiver does not own durable hook spill files, so cleanup is
+    limited to in-memory/session-local containers already attached to the
+    payload by upstream callers or tests.
+    """
+    for key in ("hook_spill_state", "spill_state"):
+        state = payload.get(key)
+        if hasattr(state, "clear"):
+            state.clear()
+    for key in ("hook_spill_paths", "spill_paths"):
+        spill_paths = payload.get(key)
+        if isinstance(spill_paths, list):
+            spill_paths.clear()
+
+
 def _run_session_archiver(
     payload: Mapping[str, Any],
     *,
@@ -736,7 +767,7 @@ def _run_session_archiver(
             handle.write(json.dumps(_sanitize_value(record), ensure_ascii=False, sort_keys=True) + "\n")
     except Exception:
         archive_status = "write_failed"
-    if record["conversation_preview"]:
+    if _should_submit_memory_candidate(record):
         try:
             _emit_memory_governance_candidate(
                 {
@@ -908,9 +939,18 @@ def build_safety_hook_overrides(
                 metadata={},
             )
         limit_token = _ACTIVE_CONTEXT_CHAR_LIMIT.set(int(normalized_config["max_context_chars"]))
+        payload_token = _ACTIVE_SESSION_ARCHIVER_PAYLOAD.set(kwargs)
         try:
             return _run_session_archiver(kwargs, config=normalized_config)
         finally:
+            try:
+                _clear_session_archiver_spill_state(payload=kwargs)
+            except Exception:
+                logger.debug(
+                    "session-archiver cleanup failed",
+                    exc_info=True,
+                )
+            _ACTIVE_SESSION_ARCHIVER_PAYLOAD.reset(payload_token)
             _ACTIVE_CONTEXT_CHAR_LIMIT.reset(limit_token)
 
     return {
