@@ -5,7 +5,8 @@ import json
 import os
 import tempfile
 import threading
-from dataclasses import dataclass
+from copy import deepcopy
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from hashlib import sha256
 from pathlib import Path
@@ -79,6 +80,7 @@ def candidate_record_id(record: Mapping[str, object]) -> str:
 class L4CandidateRecord:
     payload: dict[str, object]
     record_id: str
+    _canonical_payload: dict[str, object] = field(default_factory=dict, repr=False)
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, object]) -> "L4CandidateRecord":
@@ -99,11 +101,15 @@ class L4CandidateRecord:
         payload["record_id"] = record_id
         if "\n" in json.dumps(payload, sort_keys=True, ensure_ascii=False):
             raise ValueError("L4 record must serialize to one JSONL line")
-        return cls(payload=payload, record_id=record_id)
+        return cls(
+            payload=payload,
+            record_id=record_id,
+            _canonical_payload=deepcopy(payload),
+        )
 
 
 def _persistence_payload(record: L4CandidateRecord) -> dict[str, object]:
-    payload = dict(record.payload)
+    payload = deepcopy(record._canonical_payload or record.payload)
     for field in _READ_TIME_FIELDS:
         payload.pop(field, None)
     payload.setdefault("parent_session_id", None)
@@ -192,6 +198,8 @@ class L4Store:
         except SecurityInvariantError:
             self._disabled = True
             raise
+        if record.payload.get("profile_id") != self.profile_id:
+            raise ValueError("record profile_id does not match L4 store profile_id")
         line_text = json.dumps(_persistence_payload(record), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         if "\n" in line_text or len(line_text) > self.config.max_l4_record_chars:
             return {"written": False, "reason": "record_too_large"}
@@ -274,7 +282,8 @@ class L4Store:
                 diagnostics.append({"reason": "invalid_timestamp", "record_id": parsed.get("record_id")})
                 continue
             item = dict(parsed)
-            item.pop("decay_score", None)
+            for field in _READ_TIME_FIELDS:
+                item.pop(field, None)
             item["read_state"] = {
                 "age_days": state.age_days,
                 "decay_score": state.decay_score,
