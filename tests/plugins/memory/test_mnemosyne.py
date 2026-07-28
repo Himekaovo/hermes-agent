@@ -713,6 +713,20 @@ def test_l1_query_path_like_text_cannot_change_profile_paths(tmp_path):
     assert "prefers Chinese summaries" in items[0].content
 
 
+def test_l1_filesystem_error_fails_open_and_collects_other_files(tmp_path):
+    from plugins.memory.mnemosyne.injector import collect_l1_items
+
+    memory_dir = tmp_path / "memories"
+    memory_dir.mkdir()
+    (memory_dir / "MEMORY.md").mkdir()
+    (memory_dir / "USER.md").write_text("prefers Chinese summaries", encoding="utf-8")
+
+    items, diagnostics = collect_l1_items(tmp_path, include_sensitive=True)
+
+    assert [item.item_id for item in items] == ["L1:USER.md"]
+    assert diagnostics == [{"reason": "l1_filesystem_error", "source": "MEMORY.md"}]
+
+
 def test_l4_records_convert_to_items_with_read_time_reason():
     from plugins.memory.mnemosyne.injector import collect_l4_items
 
