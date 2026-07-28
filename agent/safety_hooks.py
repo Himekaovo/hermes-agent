@@ -404,10 +404,14 @@ def run_safety_checks(
                 results.extend(outcome)
             else:
                 results.append(outcome)
-            if index == 0 and execution_context_error is not None:
-                results.append(execution_context_error)
         results.extend(_check_security(event, payload, context))
+        if execution_context_error is not None:
+            results.append(execution_context_error)
     except Exception as exc:
+        if execution_context_error is not None and not any(
+            result.get("reason_code") == "execution_context_invalid" for result in results
+        ):
+            results.append(execution_context_error)
         results.append(
             make_result(
                 hook="safety-hooks",

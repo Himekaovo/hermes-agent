@@ -158,6 +158,26 @@ def test_identity_check_blocks_missing_session_id():
     ]
 
 
+def test_run_safety_checks_append_execution_context_error_after_ordered_hooks():
+    from agent.safety_hooks import run_safety_checks
+
+    results = run_safety_checks("pre_llm_call", {"user_message": "hello"})
+
+    assert [result["hook"] for result in results] == [
+        "identity",
+        "pm-mode",
+        "subagent-checklist",
+        "local-recall",
+        "context-propagation",
+        "security-inspector",
+        "execution-context",
+    ]
+    assert results[0]["reason_code"] == "identity_missing"
+    assert results[0]["action"] == "block"
+    assert results[-1]["reason_code"] == "execution_context_invalid"
+    assert results[-1]["action"] == "error"
+
+
 def test_run_safety_checks_reports_error_for_missing_structured_fields_with_session():
     from agent.safety_hooks import run_safety_checks
 
