@@ -132,7 +132,17 @@ def _resolve_audit_path(value: Any) -> str:
 
 
 def normalize_config(raw_config: Any) -> dict[str, Any]:
-    config = raw_config if isinstance(raw_config, Mapping) else {}
+    if raw_config is None:
+        config: Mapping[str, Any] = {}
+    elif isinstance(raw_config, Mapping):
+        config = raw_config
+    else:
+        _warn_invalid_config(
+            "raw_config",
+            raw_config,
+            reason="expected a mapping or null root object",
+        )
+        config = {}
     normalized = dict(_DEFAULT_SAFETY_HOOKS_CONFIG)
 
     for key in ("enabled", "block_high_risk"):

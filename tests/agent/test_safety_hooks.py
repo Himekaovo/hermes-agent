@@ -97,6 +97,19 @@ def test_invalid_safety_hook_config_uses_safe_defaults(caplog):
     assert "safety" in caplog.text.lower()
 
 
+@pytest.mark.parametrize("raw_config", [[], "oops", 42])
+def test_invalid_safety_hook_config_warns_for_non_mapping_root(raw_config, caplog):
+    from agent.safety_hooks import normalize_config
+
+    with caplog.at_level("WARNING"):
+        config = normalize_config(raw_config)
+
+    assert config["enabled"] is True
+    assert config["block_high_risk"] is True
+    assert config["max_context_chars"] == 12000
+    assert "raw_config" in caplog.text
+
+
 def test_safety_hook_config_clamps_positive_context_limit():
     from agent.safety_hooks import normalize_config
 
@@ -132,6 +145,27 @@ def test_safety_hook_config_rejects_absolute_external_audit_path(
 
     with caplog.at_level("WARNING"):
         config = normalize_config({"audit_path": str(tmp_path / "external.jsonl")})
+
+    assert Path(config["audit_path"]).resolve() == (
+        profile_home / "logs" / "safety" / "session-archiver.jsonl"
+    ).resolve()
+    assert "audit" in caplog.text.lower()
+
+
+def test_safety_hook_config_rejects_symlink_escape_audit_path(
+    tmp_path, monkeypatch, caplog
+):
+    from agent.safety_hooks import normalize_config
+
+    profile_home = tmp_path / "profiles" / "writer"
+    profile_home.mkdir(parents=True)
+    outside_dir = tmp_path / "outside"
+    outside_dir.mkdir()
+    (profile_home / "logs").symlink_to(outside_dir, target_is_directory=True)
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+
+    with caplog.at_level("WARNING"):
+        config = normalize_config({"audit_path": "logs/escape.jsonl"})
 
     assert Path(config["audit_path"]).resolve() == (
         profile_home / "logs" / "safety" / "session-archiver.jsonl"
