@@ -538,3 +538,97 @@ def test_l4_rewrite_uses_trusted_directory_fds(monkeypatch, tmp_path):
         and dst_dir_fd is not None
         for source, destination, src_dir_fd, dst_dir_fd in replace_calls
     )
+
+
+def _item(item_id, layer, content, score=0.5, trust=None):
+    from plugins.memory.mnemosyne.contracts import MnemosyneItem, MnemosyneSourceRef
+
+    ref = MnemosyneSourceRef(
+        layer=layer,
+        item_id=item_id,
+        source=f"source-{layer}",
+        reason_code=f"{layer.lower()}_test",
+        reason_detail=(("item_id", item_id),),
+    )
+    return MnemosyneItem(
+        item_id=item_id,
+        layer=layer,
+        content=content,
+        reason=f"reason for {item_id}",
+        reason_code=f"{layer.lower()}_test",
+        reason_detail=(("item_id", item_id),),
+        score=score,
+        source=f"source-{layer}",
+        provenance=(ref,),
+        trust=trust,
+    )
+
+
+def test_sort_items_uses_authority_then_score_then_item_id():
+    from plugins.memory.mnemosyne.injector import sort_items
+
+    items = [
+        _item("z-l2", "L2", "l2 high", score=1.0, trust=1.0),
+        _item("a-l1", "L1", "l1 low", score=0.1, trust=0.1),
+        _item("b-l1", "L1", "l1 low second", score=0.1, trust=0.1),
+    ]
+
+    assert [item.item_id for item in sort_items(items)] == ["a-l1", "b-l1", "z-l2"]
+
+
+def test_budget_borrowing_allows_l2_to_use_empty_l3_without_exceeding_caps():
+    from plugins.memory.mnemosyne.contracts import MnemosyneConfig
+    from plugins.memory.mnemosyne.injector import render_context
+
+    config = MnemosyneConfig.from_mapping({
+        "total_char_budget": 200,
+        "max_item_chars": 80,
+        "max_items_per_layer": 8,
+        "initial_layer_budgets": {"L1": 30, "L2": 50, "L3": 50, "L4": 50},
+        "hard_layer_caps": {"L1": 60, "L2": 120, "L3": 60, "L4": 60},
+    })
+    items = [
+        _item("l2-a", "L2", "a" * 60),
+        _item("l2-b", "L2", "b" * 40),
+        _item("l1-a", "L1", "core"),
+    ]
+
+    block = render_context(items, config)
+
+    assert "l2-a" in block
+    assert "l2-b" in block
+    assert len(block) <= 200
+
+
+def test_subagent_multiplier_scales_total_initial_and_hard_caps():
+    from plugins.memory.mnemosyne.contracts import MnemosyneConfig
+
+    config = MnemosyneConfig.from_mapping({}, execution_kind="subagent")
+
+    assert config.total_char_budget == 3000
+    assert config.initial_layer_budgets["L2"] == 1600
+    assert config.hard_layer_caps["L2"] == 3000
+    assert config.initial_layer_budgets["L1"] <= config.hard_layer_caps["L1"]
+
+
+def test_merge_duplicate_items_keeps_authoritative_item_and_combines_provenance():
+    from plugins.memory.mnemosyne.injector import merge_duplicate_items
+
+    merged = merge_duplicate_items([
+        _item("l3-copy", "L3", "Same memory", score=1.0),
+        _item("l1-original", "L1", " same   memory ", score=0.1),
+    ])
+
+    assert [item.item_id for item in merged] == ["l1-original"]
+    assert [ref.item_id for ref in merged[0].provenance] == ["l1-original", "l3-copy"]
+
+
+def test_scale_config_for_execution_applies_subagent_multiplier_to_existing_config():
+    from plugins.memory.mnemosyne.contracts import MnemosyneConfig
+    from plugins.memory.mnemosyne.injector import scale_config_for_execution
+
+    config = scale_config_for_execution(MnemosyneConfig.from_mapping({}), "subagent")
+
+    assert config.total_char_budget == 3000
+    assert config.initial_layer_budgets["L2"] == 1600
+    assert config.hard_layer_caps["L2"] == 3000
