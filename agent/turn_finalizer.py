@@ -390,7 +390,7 @@ def finalize_turn(
                 run_builtin_post_llm_checks,
                 run_builtin_post_llm_preflight,
             )
-            from hermes_cli.plugins import get_plugin_manager as _get_plugin_manager
+            from hermes_cli.plugins import invoke_hook as _invoke_hook
 
             _post_payload = {
                 "agent_id": getattr(agent, "agent_id", "") or getattr(agent, "session_id", ""),
@@ -420,7 +420,7 @@ def finalize_turn(
                 _post_payload["assistant_response"] = final_response
                 _post_payload["original_assistant_response"] = final_response
                 _post_payload["conversation_history"] = list(messages)
-            _post_results = _get_plugin_manager().invoke_hook("post_llm_call", **_post_payload)
+            _post_results = _invoke_hook("post_llm_call", **_post_payload)
             _global_post_results = _flatten_hook_results(_post_results)
             _builtin_post_results = run_builtin_post_llm_checks(
                 _post_payload,

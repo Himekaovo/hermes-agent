@@ -289,7 +289,6 @@ def test_post_llm_egress_preflight_sanitizes_global_hook_payload_before_block(mo
             return []
 
     monkeypatch.setattr("hermes_cli.plugins.get_plugin_manager", lambda: _FakePluginManager())
-    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
     agent = _FinalizerAgent()
 
     result = _finalize(agent, final_response="my api key is sk-test-secret")
@@ -304,6 +303,55 @@ def test_post_llm_egress_preflight_sanitizes_global_hook_payload_before_block(mo
     assert "sk-test-secret" not in json.dumps(observed)
 
 
+def test_post_llm_block_dispatch_preserves_instance_hooks_and_sanitizes_payload(monkeypatch):
+    import agent.safety_hooks as safety_hooks
+    from hermes_cli import plugins
+
+    observed_global = []
+    observed_instance = []
+
+    class _FakePluginManager:
+        def invoke_hook(self, name, **kwargs):
+            if name == "post_llm_call":
+                observed_global.append(
+                    {
+                        "assistant_response": kwargs.get("assistant_response"),
+                        "original_assistant_response": kwargs.get("original_assistant_response"),
+                    }
+                )
+                return [[{"hook": "global-post", "action": "skip"}]]
+            return []
+
+    def instance_post_hook(**kwargs):
+        observed_instance.append(
+            {
+                "assistant_response": kwargs.get("assistant_response"),
+                "original_assistant_response": kwargs.get("original_assistant_response"),
+            }
+        )
+        return {"hook": "instance-post", "action": "skip"}
+
+    monkeypatch.setattr("hermes_cli.plugins.get_plugin_manager", lambda: _FakePluginManager())
+    agent = _FinalizerAgent()
+
+    with plugins.scoped_hook_overrides({"post_llm_call": [instance_post_hook]}):
+        result = _finalize(agent, final_response="my api key is sk-test-secret")
+
+    expected = [
+        {
+            "assistant_response": safety_hooks._SAFE_EGRESS_BLOCK_MESSAGE,
+            "original_assistant_response": safety_hooks._SAFE_EGRESS_BLOCK_MESSAGE,
+        }
+    ]
+    assert result["safety_blocked"] is True
+    assert observed_global == expected
+    assert observed_instance == expected
+    assert any(item.get("hook") == "global-post" for item in result["safety_results"])
+    assert any(item.get("hook") == "instance-post" for item in result["safety_results"])
+    assert "sk-test-secret" not in json.dumps(observed_global)
+    assert "sk-test-secret" not in json.dumps(observed_instance)
+
+
 def test_post_llm_allow_path_preserves_raw_response_for_global_hooks(monkeypatch):
     observed = []
 
@@ -314,7 +362,6 @@ def test_post_llm_allow_path_preserves_raw_response_for_global_hooks(monkeypatch
             return []
 
     monkeypatch.setattr("hermes_cli.plugins.get_plugin_manager", lambda: _FakePluginManager())
-    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
     agent = _FinalizerAgent()
 
     result = _finalize(agent, final_response="All done.")
@@ -324,10 +371,43 @@ def test_post_llm_allow_path_preserves_raw_response_for_global_hooks(monkeypatch
     assert result["final_response"] == "All done."
 
 
+def test_post_llm_allow_dispatch_preserves_instance_hooks_and_raw_payload(monkeypatch):
+    from hermes_cli import plugins
+
+    observed_global = []
+    observed_instance = []
+
+    class _FakePluginManager:
+        def invoke_hook(self, name, **kwargs):
+            if name == "post_llm_call":
+                observed_global.append(kwargs.get("assistant_response"))
+                return [[{"hook": "global-post", "action": "skip"}]]
+            return []
+
+    def instance_post_hook(**kwargs):
+        observed_instance.append(kwargs.get("assistant_response"))
+        return {"hook": "instance-post", "action": "skip"}
+
+    monkeypatch.setattr("hermes_cli.plugins.get_plugin_manager", lambda: _FakePluginManager())
+    agent = _FinalizerAgent()
+
+    with plugins.scoped_hook_overrides({"post_llm_call": [instance_post_hook]}):
+        result = _finalize(agent, final_response="All done.")
+
+    assert result.get("safety_blocked") is not True
+    assert observed_global == ["All done."]
+    assert observed_instance == ["All done."]
+    assert any(item.get("hook") == "global-post" for item in result["safety_results"])
+    assert any(item.get("hook") == "instance-post" for item in result["safety_results"])
+    assert result["final_response"] == "All done."
+
+
 @pytest.mark.parametrize("verification_status", ["failed", "unavailable"])
 def test_finalize_turn_passes_structured_verification_status_to_session_archiver(
     monkeypatch, verification_status
 ):
+    from hermes_cli import plugins
+
     captured: dict[str, object] = {}
 
     class _FakePluginManager:
@@ -346,13 +426,15 @@ def test_finalize_turn_passes_structured_verification_status_to_session_archiver
                 ]]
             return []
 
+    real_invoke_hook = plugins.invoke_hook
+
     def fake_invoke_hook(name, **kwargs):
         if name == "transform_llm_output":
             return []
         if name == "on_session_end":
             captured["verification"] = kwargs.get("verification")
             return []
-        return []
+        return real_invoke_hook(name, **kwargs)
 
     monkeypatch.setattr("hermes_cli.plugins.get_plugin_manager", lambda: _FakePluginManager())
     monkeypatch.setattr("hermes_cli.plugins.invoke_hook", fake_invoke_hook)

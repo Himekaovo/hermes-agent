@@ -64,4 +64,3 @@ through a separate path.
 `wiki check` is read-only. It reports missing local paths, content drift,
 unresolved relation targets, and database availability without rewriting skill
 files, changing lifecycle state, or installing anything.
-
