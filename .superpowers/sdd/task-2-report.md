@@ -129,3 +129,35 @@ GREEN: after the write-boundary re-sanitization:
 ```
 
 `git diff --check` completed without output.
+
+## Final Review Fixes
+
+- `L4CandidateRecord.from_mapping()` retains a deep canonical construction snapshot.
+  `write_candidate()` now persists that snapshot rather than the caller-mutable
+  `payload`, so post-construction mutations cannot change identity or isolation
+  fields while retaining the original `record_id`.
+- `write_candidate()` rejects a record whose current `payload["profile_id"]`
+  differs from `L4Store.profile_id` before it can cross the persistence boundary.
+- `read_records()` removes every legacy top-level derived field (`decay_score`,
+  `age_days`, and `archive_recommended`) before adding the computed `read_state`.
+
+## Final Review GREEN Evidence
+
+```text
+./.venv/bin/python -m pytest \
+  tests/plugins/memory/test_mnemosyne.py::test_l4_write_preserves_constructed_identity_after_payload_mutation \
+  tests/plugins/memory/test_mnemosyne.py::test_l4_write_rejects_mutated_profile_id \
+  tests/plugins/memory/test_mnemosyne.py::test_l4_read_strips_all_legacy_derived_fields \
+  -q
+
+3 passed in 0.07s
+```
+
+```text
+./.venv/bin/python -m pytest tests/plugins/memory/test_mnemosyne.py -q
+
+17 passed in 0.07s
+```
+
+`./.venv/bin/python -m py_compile plugins/memory/mnemosyne/l4_store.py` and
+`git diff --check` completed successfully.

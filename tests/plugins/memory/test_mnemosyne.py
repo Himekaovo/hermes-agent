@@ -293,6 +293,63 @@ def test_l4_write_resanitizes_mutated_candidate_payload(tmp_path):
     assert "archive_recommended" not in persisted
 
 
+def test_l4_write_preserves_constructed_identity_after_payload_mutation(tmp_path):
+    from plugins.memory.mnemosyne.contracts import MnemosyneConfig
+    from plugins.memory.mnemosyne.l4_store import L4CandidateRecord, L4Store
+
+    store = L4Store(tmp_path, profile_id="coder", config=MnemosyneConfig.from_mapping({}))
+    record = L4CandidateRecord.from_mapping(_l4_record())
+    record.payload["parent_session_id"] = ""
+    record.payload["content"] = "A caller-mutated lesson."
+
+    assert store.write_candidate(record)["written"] is True
+    persisted = json.loads(store.path.read_text(encoding="utf-8"))
+    assert persisted["record_id"] == record.record_id
+    assert persisted["parent_session_id"] is None
+    assert persisted["content"] == _l4_record()["content"]
+
+
+def test_l4_write_rejects_mutated_profile_id(tmp_path):
+    from plugins.memory.mnemosyne.contracts import MnemosyneConfig
+    from plugins.memory.mnemosyne.l4_store import L4CandidateRecord, L4Store
+
+    store = L4Store(tmp_path, profile_id="coder", config=MnemosyneConfig.from_mapping({}))
+    record = L4CandidateRecord.from_mapping(_l4_record())
+    record.payload["profile_id"] = "other-profile"
+
+    with pytest.raises(ValueError, match="profile_id"):
+        store.write_candidate(record)
+
+
+def test_l4_read_strips_all_legacy_derived_fields(tmp_path):
+    from plugins.memory.mnemosyne.contracts import MnemosyneConfig
+    from plugins.memory.mnemosyne.l4_store import L4Store
+
+    l4_path = tmp_path / "memories" / "mnemosyne" / "l4.jsonl"
+    l4_path.parent.mkdir(parents=True)
+    l4_path.write_text(
+        json.dumps({
+            **_l4_record(created_at="2026-01-01T00:00:00Z"),
+            "record_id": "l4_legacy",
+            "decay_score": 1.0,
+            "age_days": 1,
+            "archive_recommended": False,
+        }) + "\n",
+        encoding="utf-8",
+    )
+    store = L4Store(tmp_path, profile_id="coder", config=MnemosyneConfig.from_mapping({}))
+
+    records, diagnostics = store.read_records(now=datetime(2026, 7, 28, tzinfo=timezone.utc))
+
+    assert diagnostics == []
+    assert not {"decay_score", "age_days", "archive_recommended"} & records[0].keys()
+    assert records[0]["read_state"] == {
+        "age_days": 208,
+        "decay_score": 0.0,
+        "archive_recommended": True,
+    }
+
+
 def test_l4_parent_session_id_type_and_none_id_are_distinct_from_empty():
     from plugins.memory.mnemosyne.l4_store import L4CandidateRecord
 
