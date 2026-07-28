@@ -23,6 +23,35 @@ def test_safety_result_is_json_serializable_and_redacts_secret_values():
     assert "sk-test-secret" not in repr(result)
 
 
+def test_deeply_nested_secret_values_are_not_exposed_at_depth_cap():
+    from agent.safety_hooks import make_result
+
+    result = make_result(
+        hook="security-inspector",
+        event="pre_llm_call",
+        action="warn",
+        reason_code="secret_detected",
+        risk_level="medium",
+        message="nested secret",
+        metadata={
+            "nested": {
+                "level1": {
+                    "level2": {
+                        "level3": {
+                            "token": "sk-deep-secret-value",
+                            "password": "super-secret-password",
+                        }
+                    }
+                }
+            }
+        },
+    )
+
+    json.dumps(result)
+    assert "sk-deep-secret-value" not in repr(result)
+    assert "super-secret-password" not in repr(result)
+
+
 def test_context_is_capped_before_it_can_be_returned():
     from agent.safety_hooks import bounded_context
 
@@ -69,6 +98,23 @@ def test_normalize_execution_context_preserves_none_parent_session_id_for_root_e
             "agent_id": "agent-1",
             "execution_kind": "interactive",
             "session_id": "root-session",
+            "task_id": "t1",
+            "turn_id": "u1",
+        }
+    )
+
+    assert context["parent_session_id"] is None
+
+
+def test_normalize_execution_context_treats_blank_parent_session_id_as_none():
+    from agent.safety_hooks import normalize_execution_context
+
+    context = normalize_execution_context(
+        {
+            "agent_id": "agent-1",
+            "execution_kind": "interactive",
+            "session_id": "root-session",
+            "parent_session_id": "   ",
             "task_id": "t1",
             "turn_id": "u1",
         }

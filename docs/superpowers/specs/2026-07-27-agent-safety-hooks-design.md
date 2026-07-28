@@ -188,7 +188,7 @@ Hook 抛异常、超时、畸形输入或无法判断 → ERROR，然后按该�
 - `pre_llm_call` 固定顺序为 `identity → mode → delegation/context → recall → security`，其中 `BLOCK` 阻止当前模型调用；
 - `post_llm_call` 固定顺序为 `egress → verification → A2A metadata → generic postprocessing`，其中 egress 针对原始输出执行；
 - `on_session_end` 只有 `session-archiver`，任何结果都不能阻止清理流程；
-- 单个 callback 异常由现有 Hook 隔离逻辑捕获，并降级为 warning。
+- 单个 callback 异常由现有 Hook 隔离逻辑捕获，并记录为 `ERROR` 结果；dispatcher 策略对这类异常保持 fail-open，只有显式 `BLOCK` 结果才阻止当前调用。
 
 记忆边界固定为：
 

@@ -69,9 +69,26 @@ def _sanitize_string(value: str) -> str:
     return bounded_context(redacted)
 
 
+def _truncated_marker(value_type: str, size: int | None = None) -> dict[str, Any]:
+    marker: dict[str, Any] = {"truncated": True, "type": value_type}
+    if size is not None:
+        marker["size"] = size
+    return marker
+
+
 def _sanitize_value(value: Any, *, depth: int = 0) -> Any:
     if depth >= _MAX_DEPTH:
-        return bounded_context(value)
+        if isinstance(value, str):
+            return _sanitize_string(value)
+        if isinstance(value, bool) or value is None:
+            return value
+        if isinstance(value, (int, float)):
+            return value
+        if isinstance(value, dict):
+            return _truncated_marker("dict", min(len(value), _MAX_DICT_ITEMS))
+        if isinstance(value, (list, tuple)):
+            return _truncated_marker("list", min(len(value), _MAX_LIST_ITEMS))
+        return _truncated_marker(type(value).__name__)
     if isinstance(value, str):
         return _sanitize_string(value)
     if isinstance(value, bool) or value is None:
@@ -135,12 +152,12 @@ def normalize_execution_context(payload: dict[str, Any]) -> dict[str, Any]:
         "session_id": bounded_context(payload["session_id"], max_chars=120),
         "task_id": bounded_context(payload["task_id"], max_chars=120),
         "turn_id": bounded_context(payload["turn_id"], max_chars=120),
-        "parent_session_id": (
-            None
-            if payload.get("parent_session_id") is None
-            else _sanitize_value(payload.get("parent_session_id"))
-        ),
+        "parent_session_id": None,
     }
+    parent_session_id = payload.get("parent_session_id")
+    if parent_session_id is not None:
+        parent_text = bounded_context(parent_session_id, max_chars=120).strip()
+        context["parent_session_id"] = None if not parent_text else _sanitize_value(parent_text)
     for optional in (
         "user_message",
         "planning_mode",
