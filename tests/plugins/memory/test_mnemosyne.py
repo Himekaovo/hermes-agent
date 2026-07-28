@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 from datetime import datetime, timezone
 import json
 import multiprocessing
@@ -632,3 +632,54 @@ def test_scale_config_for_execution_applies_subagent_multiplier_to_existing_conf
     assert config.total_char_budget == 3000
     assert config.initial_layer_budgets["L2"] == 1600
     assert config.hard_layer_caps["L2"] == 3000
+
+
+def test_rendered_line_length_respects_layer_hard_cap_with_long_reason():
+    from plugins.memory.mnemosyne.contracts import MnemosyneConfig
+    from plugins.memory.mnemosyne.injector import render_context
+
+    config = MnemosyneConfig.from_mapping({
+        "total_char_budget": 1000,
+        "max_item_chars": 40,
+        "initial_layer_budgets": {"L1": 0, "L2": 70, "L3": 0, "L4": 0},
+        "hard_layer_caps": {"L1": 0, "L2": 70, "L3": 0, "L4": 0},
+    })
+    item = replace(_item("l2-long", "L2", "content" * 20), reason="r" * 600)
+
+    block = render_context([item], config)
+    l2_lines = [line for line in block.splitlines() if line.startswith("- L2:")]
+
+    assert l2_lines
+    assert sum(map(len, l2_lines)) <= config.hard_layer_caps["L2"]
+    assert len(block) <= config.total_char_budget
+
+
+def test_scale_config_for_execution_honors_custom_subagent_multiplier():
+    from plugins.memory.mnemosyne.contracts import MnemosyneConfig
+    from plugins.memory.mnemosyne.injector import scale_config_for_execution
+
+    config = MnemosyneConfig.from_mapping({
+        "total_char_budget": 1001,
+        "initial_layer_budgets": {"L2": 401},
+        "hard_layer_caps": {"L2": 801},
+        "subagent_multiplier": 0.25,
+    })
+
+    scaled = scale_config_for_execution(config, "subagent")
+
+    assert scaled.total_char_budget == 250
+    assert scaled.initial_layer_budgets["L2"] == 100
+    assert scaled.hard_layer_caps["L2"] == 200
+
+
+def test_merge_duplicate_items_with_empty_provenance_returns_new_item():
+    from plugins.memory.mnemosyne.injector import merge_duplicate_items
+
+    first = replace(_item("l2-copy", "L2", "Same memory"), provenance=())
+    second = replace(_item("l1-original", "L1", "same memory"), provenance=())
+
+    merged = merge_duplicate_items([first, second])
+
+    assert merged[0] is not first
+    assert merged[0] is not second
+    assert merged[0].provenance == ()

@@ -7,8 +7,6 @@ from math import floor
 
 from .contracts import (
     AUTHORITY_RANK,
-    DEFAULT_CRON_MULTIPLIER,
-    DEFAULT_SUBAGENT_MULTIPLIER,
     LAYERS,
     MnemosyneConfig,
     MnemosyneItem,
@@ -53,36 +51,44 @@ def merge_duplicate_items(items: list[MnemosyneItem]) -> list[MnemosyneItem]:
         ordered = sort_items(group)
         primary = ordered[0]
         provenance = tuple(ref for item in ordered for ref in item.provenance)
-        if provenance == primary.provenance:
-            merged.append(primary)
-        else:
-            merged.append(
-                MnemosyneItem(
-                    item_id=primary.item_id,
-                    layer=primary.layer,
-                    content=primary.content,
-                    reason=primary.reason,
-                    reason_code=primary.reason_code,
-                    reason_detail=primary.reason_detail,
-                    score=primary.score,
-                    source=primary.source,
-                    provenance=provenance,
-                    trust=primary.trust,
-                    created_at=primary.created_at,
-                    expires_at=primary.expires_at,
-                )
+        merged.append(
+            MnemosyneItem(
+                item_id=primary.item_id,
+                layer=primary.layer,
+                content=primary.content,
+                reason=primary.reason,
+                reason_code=primary.reason_code,
+                reason_detail=primary.reason_detail,
+                score=primary.score,
+                source=primary.source,
+                provenance=provenance,
+                trust=primary.trust,
+                created_at=primary.created_at,
+                expires_at=primary.expires_at,
             )
+        )
     return sort_items(merged)
 
 
-def _item_line(item: MnemosyneItem, max_item_chars: int) -> str:
+def _item_line(
+    item: MnemosyneItem, max_item_chars: int, max_line_chars: int
+) -> str | None:
+    prefix_base = f"- {item.layer}:"
+    if max_line_chars <= len(prefix_base) + 1:
+        return None
+
+    identifier = item.item_id.strip()[: max_line_chars - len(prefix_base) - 1]
+    prefix = f"{prefix_base}{identifier}"
+    payload_capacity = max_line_chars - len(prefix) - 2
+    if payload_capacity < 0:
+        return f"{prefix}\n"
+
     content = item.content[:max_item_chars].strip()
     reason = item.reason.strip()
-    return f"- {item.layer}:{item.item_id} {content} ({reason})\n"
-
-
-def _item_cost(item: MnemosyneItem, max_item_chars: int) -> int:
-    return len(item.content[:max_item_chars].strip())
+    reason_chars = min(len(reason), payload_capacity // 3)
+    reason_suffix = f" ({reason[:reason_chars]})" if reason_chars else ""
+    content_chars = min(len(content), payload_capacity - len(reason_suffix))
+    return f"{prefix} {content[:content_chars]}{reason_suffix}\n"
 
 
 def scale_config_for_execution(
@@ -90,9 +96,9 @@ def scale_config_for_execution(
 ) -> MnemosyneConfig:
     multiplier = 1.0
     if execution_kind == "cron":
-        multiplier = DEFAULT_CRON_MULTIPLIER
+        multiplier = config.cron_multiplier
     elif execution_kind == "subagent":
-        multiplier = DEFAULT_SUBAGENT_MULTIPLIER
+        multiplier = config.subagent_multiplier
     if multiplier == 1.0:
         return config
     return replace(
@@ -118,42 +124,56 @@ def render_context(items: list[MnemosyneItem], config: MnemosyneConfig) -> str:
     def remaining_total() -> int:
         return config.total_char_budget - sum(len(line) for line in lines)
 
-    deferred: list[tuple[MnemosyneItem, str]] = []
+    deferred: list[MnemosyneItem] = []
     for item in sorted_items:
         if emitted_by_layer[item.layer] >= config.max_items_per_layer:
             continue
-        line = _item_line(item, config.max_item_chars)
-        cost = _item_cost(item, config.max_item_chars)
-        if (
-            cost <= config.initial_layer_budgets[item.layer] - used_by_layer[item.layer]
-            and cost <= remaining_total()
-        ):
+        line = _item_line(
+            item,
+            config.max_item_chars,
+            min(
+                config.initial_layer_budgets[item.layer] - used_by_layer[item.layer],
+                remaining_total(),
+            ),
+        )
+        if line is not None:
+            cost = len(line)
             lines.append(line)
             used_by_layer[item.layer] += cost
             emitted_by_layer[item.layer] += 1
         else:
-            deferred.append((item, line))
+            deferred.append(item)
 
     shared_pool = sum(
         max(0, config.initial_layer_budgets[layer] - used_by_layer[layer])
         for layer in LAYERS
     )
     for layer in ("L2", "L1", "L4", "L3"):
-        for item, line in list(deferred):
+        for item in list(deferred):
             if item.layer != layer:
                 continue
             if emitted_by_layer[layer] >= config.max_items_per_layer:
                 continue
-            cost = _item_cost(item, config.max_item_chars)
-            can_borrow = min(
-                shared_pool, config.hard_layer_caps[layer] - used_by_layer[layer]
+            line = _item_line(
+                item,
+                config.max_item_chars,
+                min(
+                    shared_pool,
+                    config.hard_layer_caps[layer] - used_by_layer[layer],
+                    remaining_total(),
+                ),
             )
-            if cost <= can_borrow and cost <= remaining_total():
+            if line is None:
+                continue
+            cost = len(line)
+            if cost <= min(
+                shared_pool, config.hard_layer_caps[layer] - used_by_layer[layer]
+            ) and cost <= remaining_total():
                 lines.append(line)
                 used_by_layer[layer] += cost
                 emitted_by_layer[layer] += 1
                 shared_pool -= cost
-                deferred.remove((item, line))
+                deferred.remove(item)
 
     rendered = "".join(lines).rstrip()
     if len(rendered) > config.total_char_budget:
