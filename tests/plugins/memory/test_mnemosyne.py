@@ -381,6 +381,49 @@ def test_provider_prefetch_includes_injected_l2_and_l3_without_writing(tmp_path)
     assert wiki.calls == ["list_skills"]
 
 
+def test_provider_skillwiki_uses_initialized_hermes_home_not_global_profile(tmp_path):
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from plugins.memory.mnemosyne import MnemosyneProvider
+    from tools.skillwiki import SkillWiki
+    from tools.skills_hub import SkillBundle
+
+    profile_a = tmp_path / "profile-a"
+    profile_b = tmp_path / "profile-b"
+    profile_b_hub = profile_b / "skills" / ".hub"
+    leaked_skill_path = profile_b / "skills" / "leaked-skill"
+    leaked_skill_path.mkdir(parents=True)
+    (leaked_skill_path / "SKILL.md").write_text(
+        "---\nname: leaked-skill\n---\n",
+        encoding="utf-8",
+    )
+    leaked_db = profile_b_hub / "provenance.db"
+    leaked_db.parent.mkdir(parents=True)
+    result = SkillWiki(leaked_db).record_import(
+        SkillBundle(
+            name="leaked-skill",
+            files={"SKILL.md": "---\nname: leaked-skill\n---\n"},
+            source="official",
+            identifier="leaked-skill",
+            trust_level="builtin",
+        ),
+        leaked_skill_path,
+    )
+    assert result.available is True
+
+    token = set_hermes_home_override(profile_b)
+    try:
+        provider = MnemosyneProvider()
+        provider.initialize("s1", hermes_home=str(profile_a), agent_identity="coder")
+    finally:
+        reset_hermes_home_override(token)
+
+    block = provider.prefetch("which skill handles leaked-skill?")
+
+    assert "leaked-skill" not in block
+    assert provider._skillwiki.db_path == profile_a / "skills" / ".hub" / "provenance.db"
+    assert provider._skillwiki.db_path != leaked_db
+
+
 class _ThrowingProviderRetriever:
     def search(self, *args, **kwargs):
         raise RuntimeError("l2 offline")
