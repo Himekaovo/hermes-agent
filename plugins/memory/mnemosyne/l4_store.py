@@ -95,7 +95,7 @@ class L4CandidateRecord:
     def from_mapping(cls, value: Mapping[str, object]) -> "L4CandidateRecord":
         payload = dict(value)
         payload.setdefault("parent_session_id", None)
-        payload.setdefault("governance_state", "candidate")
+        payload["governance_state"] = "candidate"
         payload.setdefault("created_at", _now_iso())
         payload.setdefault("last_validated_at", None)
         payload.setdefault("archived_at", None)
@@ -130,6 +130,7 @@ def _persistence_payload(record: L4CandidateRecord) -> dict[str, object]:
     if candidate_record_id(payload) != record.record_id:
         raise ValueError("canonical L4 payload does not match record_id")
     payload["record_id"] = record.record_id
+    payload["governance_state"] = "candidate"
     return payload
 
 
@@ -367,9 +368,14 @@ class L4Store:
         ):
             raise ValueError("record profile_id does not match L4 store profile_id")
         line_text = json.dumps(persistence_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-        if "\n" in line_text or len(line_text) > self.config.max_l4_record_chars:
+        line_bytes = line_text.encode("utf-8")
+        if (
+            "\n" in line_text
+            or len(line_text) > self.config.max_l4_record_chars
+            or len(line_bytes) > self.config.max_l4_record_chars
+        ):
             return {"written": False, "reason": "record_too_large"}
-        line = (line_text + "\n").encode("utf-8")
+        line = line_bytes + b"\n"
         try:
             with self._lock():
                 with self._trusted_parent_dir_fd(create=True) as parent_fd:
@@ -392,7 +398,10 @@ class L4Store:
                         existing = b"".join(raw_lines)
                         separator = b"" if not existing or existing.endswith((b"\n", b"\r")) else b"\n"
                         final = existing + separator + line
-                        if len(final.decode("utf-8", errors="ignore")) > self.config.max_l4_file_chars:
+                        if (
+                            len(final.decode("utf-8", errors="ignore")) > self.config.max_l4_file_chars
+                            or len(final) > self.config.max_l4_file_chars
+                        ):
                             return {"written": False, "reason": "file_too_large"}
                         if parent_fd is None:
                             self._rewrite_fallback(final)

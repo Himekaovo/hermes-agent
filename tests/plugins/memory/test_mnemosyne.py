@@ -531,6 +531,19 @@ def test_l4_parent_session_id_participates_in_candidate_key(tmp_path):
     assert diagnostics == []
 
 
+def test_l4_candidate_api_forces_governance_state_to_candidate(tmp_path):
+    from plugins.memory.mnemosyne.contracts import MnemosyneConfig
+    from plugins.memory.mnemosyne.l4_store import L4CandidateRecord, L4Store
+
+    store = L4Store(tmp_path, profile_id="coder", config=MnemosyneConfig.from_mapping({}))
+    record = L4CandidateRecord.from_mapping(_l4_record(governance_state="approved"))
+
+    assert record.payload["governance_state"] == "candidate"
+    assert store.write_candidate(record)["written"] is True
+    persisted = json.loads(store.path.read_text(encoding="utf-8"))
+    assert persisted["governance_state"] == "candidate"
+
+
 def test_l4_decay_is_read_time_only_and_legacy_decay_score_is_ignored(tmp_path):
     from plugins.memory.mnemosyne.contracts import MnemosyneConfig
     from plugins.memory.mnemosyne.l4_store import L4Store
@@ -876,6 +889,59 @@ def test_l4_rewrite_uses_trusted_directory_fds(monkeypatch, tmp_path):
         and dst_dir_fd is not None
         for source, destination, src_dir_fd, dst_dir_fd in replace_calls
     )
+
+
+def test_l4_write_rejects_record_over_utf8_byte_limit(tmp_path):
+    from plugins.memory.mnemosyne.contracts import MnemosyneConfig
+    from plugins.memory.mnemosyne.l4_store import L4CandidateRecord, L4Store
+
+    record = L4CandidateRecord.from_mapping(_l4_record(content="界" * 8))
+    line_text = json.dumps(record.payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    assert len(line_text) < len(line_text.encode("utf-8"))
+    store = L4Store(
+        tmp_path,
+        profile_id="coder",
+        config=MnemosyneConfig.from_mapping({"max_l4_record_chars": len(line_text)}),
+    )
+
+    assert store.write_candidate(record) == {"written": False, "reason": "record_too_large"}
+    assert not store.path.exists()
+
+
+def test_l4_write_rejects_file_over_utf8_byte_limit_without_rewrite(tmp_path):
+    from plugins.memory.mnemosyne.contracts import MnemosyneConfig
+    from plugins.memory.mnemosyne.l4_store import L4CandidateRecord, L4Store
+
+    l4_path = tmp_path / "memories" / "mnemosyne" / "l4.jsonl"
+    l4_path.parent.mkdir(parents=True)
+    existing = L4CandidateRecord.from_mapping(_l4_record(content="existing ascii lesson"))
+    existing_text = json.dumps(
+        existing.payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ) + "\n"
+    l4_path.write_text(existing_text, encoding="utf-8")
+    new_record = L4CandidateRecord.from_mapping(_l4_record(content="界" * 8))
+    new_line = json.dumps(
+        new_record.payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ) + "\n"
+    final_text = existing_text + new_line
+    assert len(final_text) < len(final_text.encode("utf-8"))
+    store = L4Store(
+        tmp_path,
+        profile_id="coder",
+        config=MnemosyneConfig.from_mapping({
+            "max_l4_file_chars": len(final_text),
+            "max_l4_record_chars": len(new_line.encode("utf-8")),
+        }),
+    )
+
+    assert store.write_candidate(new_record) == {"written": False, "reason": "file_too_large"}
+    assert l4_path.read_text(encoding="utf-8") == existing_text
 
 
 def _item(item_id, layer, content, score=0.5, trust=None):
