@@ -20,6 +20,16 @@ _OBSERVED_MEMORY_ACTIONS = {"add", "replace"}
 _OBSERVED_EXECUTION_KINDS = {"interactive", "primary", "subagent", "cron", "flush"}
 
 
+def _skillwiki_db_path(hermes_home: Path) -> Path | None:
+    root = Path(hermes_home).expanduser().resolve(strict=False)
+    db_path = root / "skills" / ".hub" / "provenance.db"
+    try:
+        db_path.resolve(strict=False).relative_to(root)
+    except (OSError, ValueError):
+        return None
+    return db_path
+
+
 class MnemosyneProvider(MemoryProvider):
     def __init__(self, config: dict[str, Any] | None = None) -> None:
         self._raw_config = dict(config or {})
@@ -80,10 +90,11 @@ class MnemosyneProvider(MemoryProvider):
         except Exception:
             self._retriever = None
         try:
-            from tools.skills_hub import _hub_dir
             from tools.skillwiki import SkillWiki
 
-            self._skillwiki = SkillWiki(_hub_dir() / "provenance.db")
+            skillwiki_db = _skillwiki_db_path(self._hermes_home)
+            if skillwiki_db is not None:
+                self._skillwiki = SkillWiki(skillwiki_db)
         except Exception:
             self._skillwiki = None
 
