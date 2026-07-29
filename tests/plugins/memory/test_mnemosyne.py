@@ -249,6 +249,24 @@ def test_provider_prefetch_fails_open_with_available_l1_when_l4_unavailable(tmp_
     assert "Prefer rollback-first recovery." in block
 
 
+def test_provider_initialize_empty_home_does_not_bootstrap_l2_db(tmp_path):
+    from plugins.memory.mnemosyne import MnemosyneProvider
+
+    db_artifacts = [
+        tmp_path / "memory_store.db",
+        tmp_path / "memory_store.db-wal",
+        tmp_path / "memory_store.db-shm",
+    ]
+    provider = MnemosyneProvider()
+
+    provider.initialize("s1", hermes_home=str(tmp_path), agent_identity="coder")
+    block = provider.prefetch("rollback")
+
+    assert block == ""
+    assert provider._retriever is None
+    assert all(not artifact.exists() for artifact in db_artifacts)
+
+
 def test_bridge_protocol_exists_but_provider_uses_no_network(monkeypatch, tmp_path):
     import socket
 

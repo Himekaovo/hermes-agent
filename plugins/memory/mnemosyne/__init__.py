@@ -75,7 +75,8 @@ class MnemosyneProvider(MemoryProvider):
             from plugins.memory.holographic.store import MemoryStore as HoloStore
 
             holo_db = self._hermes_home / "memory_store.db"
-            self._retriever = FactRetriever(store=HoloStore(db_path=holo_db))
+            if holo_db.exists():
+                self._retriever = FactRetriever(store=HoloStore(db_path=holo_db))
         except Exception:
             self._retriever = None
         try:
