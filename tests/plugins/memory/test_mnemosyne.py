@@ -249,6 +249,151 @@ def test_provider_prefetch_fails_open_with_available_l1_when_l4_unavailable(tmp_
     assert "Prefer rollback-first recovery." in block
 
 
+def test_bridge_protocol_exists_but_provider_uses_no_network(monkeypatch, tmp_path):
+    import socket
+
+    from plugins.memory.mnemosyne import MnemosyneProvider
+    from plugins.memory.mnemosyne.bridge import MnemosyneBridge
+
+    calls = []
+
+    def fail_socket(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise AssertionError("network forbidden")
+
+    monkeypatch.setattr(socket, "create_connection", fail_socket)
+    provider = MnemosyneProvider()
+    provider.initialize("s1", hermes_home=str(tmp_path), agent_identity="coder")
+
+    provider.prefetch("deployment")
+    provider.sync_turn("hello", "world")
+    provider.on_session_end([])
+
+    assert calls == []
+    assert hasattr(MnemosyneBridge, "fetch")
+    assert hasattr(MnemosyneBridge, "publish")
+
+
+def test_provider_prefetch_merges_l1_and_l4_context(tmp_path):
+    from plugins.memory.mnemosyne import MnemosyneProvider
+    from plugins.memory.mnemosyne.l4_store import L4CandidateRecord
+
+    memory_dir = tmp_path / "memories"
+    memory_dir.mkdir()
+    (memory_dir / "USER.md").write_text("prefers Chinese summaries", encoding="utf-8")
+
+    provider = MnemosyneProvider({"l4_candidate_observation": True})
+    provider.initialize("s1", hermes_home=str(tmp_path), agent_identity="coder")
+    provider._l4_store.write_candidate(
+        L4CandidateRecord.from_mapping(_l4_record(profile_id="coder"))
+    )
+
+    block = provider.prefetch("rollback migration")
+
+    assert "## Mnemosyne Memory Tower" in block
+    assert "prefers Chinese summaries" in block
+    assert "rollback" in block
+    assert "reason:" in block
+
+
+class _ProviderInjectedRetriever:
+    def __init__(self):
+        self.calls = []
+
+    def search(self, query, *, min_trust=0.3, limit=8, mark_retrieved=True, **kwargs):
+        self.calls.append({
+            "query": query,
+            "min_trust": min_trust,
+            "limit": limit,
+            "mark_retrieved": mark_retrieved,
+            "kwargs": kwargs,
+        })
+        return [{
+            "fact_id": 42,
+            "content": "Rollback migrations before retrying deployment.",
+            "trust_score": 0.9,
+            "score": 0.81,
+            "reason": {
+                "summary": "matched rollback migration",
+                "strategy": "fts+jaccard+hrr+trust",
+                "matched_terms": ["rollback", "migration"],
+            },
+        }]
+
+
+class _ProviderInjectedWiki:
+    def __init__(self):
+        self.calls = []
+
+    def list_skills(self):
+        self.calls.append("list_skills")
+        return type("Result", (), {
+            "available": True,
+            "items": [{
+                "skill_id": "local:deploy-helper",
+                "name": "deploy-helper",
+                "status": "verified",
+                "source_url": "file:///skills/deploy-helper",
+                "content_hash": "sha256:deploy",
+            }],
+        })()
+
+
+def test_provider_prefetch_includes_injected_l2_and_l3_without_writing(tmp_path):
+    from plugins.memory.mnemosyne import MnemosyneProvider
+
+    provider = MnemosyneProvider()
+    provider.initialize("s1", hermes_home=str(tmp_path), agent_identity="coder")
+    retriever = _ProviderInjectedRetriever()
+    wiki = _ProviderInjectedWiki()
+    provider._retriever = retriever
+    provider._skillwiki = wiki
+
+    block = provider.prefetch("which skill handles rollback migration deploy-helper?")
+
+    assert "Rollback migrations before retrying deployment." in block
+    assert "skill deploy-helper is verified" in block
+    assert retriever.calls == [{
+        "query": "which skill handles rollback migration deploy-helper?",
+        "min_trust": 0.3,
+        "limit": provider._config.max_items_per_layer,
+        "mark_retrieved": False,
+        "kwargs": {},
+    }]
+    assert wiki.calls == ["list_skills"]
+
+
+class _ThrowingProviderRetriever:
+    def search(self, *args, **kwargs):
+        raise RuntimeError("l2 offline")
+
+
+class _ThrowingProviderWiki:
+    def list_skills(self):
+        raise RuntimeError("l3 offline")
+
+
+def test_provider_prefetch_fails_open_when_injected_l2_and_l3_throw(tmp_path):
+    from plugins.memory.mnemosyne import MnemosyneProvider
+
+    memory_dir = tmp_path / "memories"
+    memory_dir.mkdir()
+    (memory_dir / "MEMORY.md").write_text(
+        "Prefer rollback-first recovery.",
+        encoding="utf-8",
+    )
+    provider = MnemosyneProvider()
+    provider.initialize("s1", hermes_home=str(tmp_path), agent_identity="coder")
+    provider._retriever = _ThrowingProviderRetriever()
+    provider._skillwiki = _ThrowingProviderWiki()
+
+    block = provider.prefetch("rollback skill")
+
+    assert "Prefer rollback-first recovery." in block
+    assert "l2 offline" not in block
+    assert "l3 offline" not in block
+
+
 def test_provider_prefetch_includes_sensitive_l1_only_for_interactive_root(tmp_path):
     from plugins.memory.mnemosyne import MnemosyneProvider
 

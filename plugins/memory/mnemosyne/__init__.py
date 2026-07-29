@@ -6,7 +6,13 @@ from typing import Any, Dict, List
 from agent.memory_provider import MemoryProvider
 
 from .contracts import MnemosyneConfig
-from .injector import collect_l1_items, collect_l4_items, render_context
+from .injector import (
+    collect_l1_items,
+    collect_l2_items,
+    collect_l3_items,
+    collect_l4_items,
+    render_context,
+)
 from .l4_store import L4CandidateRecord, L4Store, SecurityInvariantError
 
 
@@ -26,6 +32,8 @@ class MnemosyneProvider(MemoryProvider):
         self._hermes_home = Path(".")
         self._candidate_buffer: list[dict[str, object]] = []
         self._l4_store: L4Store | None = None
+        self._retriever: object | None = None
+        self._skillwiki: object | None = None
         self._disabled = False
 
     @property
@@ -60,6 +68,23 @@ class MnemosyneProvider(MemoryProvider):
             profile_id=self._profile_id,
             config=self._config,
         )
+        self._retriever = None
+        self._skillwiki = None
+        try:
+            from plugins.memory.holographic.retrieval import FactRetriever
+            from plugins.memory.holographic.store import MemoryStore as HoloStore
+
+            holo_db = self._hermes_home / "memory_store.db"
+            self._retriever = FactRetriever(store=HoloStore(db_path=holo_db))
+        except Exception:
+            self._retriever = None
+        try:
+            from tools.skills_hub import _hub_dir
+            from tools.skillwiki import SkillWiki
+
+            self._skillwiki = SkillWiki(_hub_dir() / "provenance.db")
+        except Exception:
+            self._skillwiki = None
 
     def system_prompt_block(self) -> str:
         return (
@@ -72,6 +97,8 @@ class MnemosyneProvider(MemoryProvider):
         if self._disabled:
             return ""
         l1_items = []
+        l2_items = []
+        l3_items = []
         l4_items = []
         try:
             include_sensitive = self._include_sensitive_l1()
@@ -89,6 +116,22 @@ class MnemosyneProvider(MemoryProvider):
         except Exception:
             l1_items = []
         try:
+            retriever = getattr(self, "_retriever", None)
+            if retriever is not None:
+                l2_items, _l2_diagnostics = collect_l2_items(
+                    retriever,
+                    query,
+                    limit=self._config.max_items_per_layer,
+                )
+        except Exception:
+            l2_items = []
+        try:
+            skillwiki = getattr(self, "_skillwiki", None)
+            if skillwiki is not None:
+                l3_items, _l3_diagnostics = collect_l3_items(skillwiki, query)
+        except Exception:
+            l3_items = []
+        try:
             if self._l4_store is not None:
                 records, l4_diagnostics = self._l4_store.read_records()
                 if _has_security_diagnostic(l4_diagnostics):
@@ -100,7 +143,7 @@ class MnemosyneProvider(MemoryProvider):
             return ""
         except Exception:
             l4_items = []
-        items = l1_items + l4_items
+        items = l1_items + l2_items + l3_items + l4_items
         if not items:
             return ""
         try:
