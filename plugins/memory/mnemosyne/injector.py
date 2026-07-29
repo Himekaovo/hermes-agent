@@ -298,7 +298,7 @@ def _item_line(
     content = item.content[:max_item_chars].strip()
     reason = item.reason.strip()
     reason_chars = min(len(reason), payload_capacity // 3)
-    reason_suffix = f" ({reason[:reason_chars]})" if reason_chars else ""
+    reason_suffix = f" (reason: {reason[:reason_chars]})" if reason_chars else ""
     content_chars = min(len(content), payload_capacity - len(reason_suffix))
     return f"{prefix} {content[:content_chars]}{reason_suffix}\n"
 
